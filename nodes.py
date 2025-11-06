@@ -133,12 +133,9 @@ def create_feather_mask(size, overlap):
     
     return mask
 
-def init_pipeline(version, mode, device, dtype, alt_vae="none"):
-    suffix = ""
-    if version == "1.1":
-        suffix = "-v1.1"
-    model_downlod(model_name="JunhaoZhuang/FlashVSR"+suffix)
-    model_path = os.path.join(folder_paths.models_dir, "FlashVSR"+suffix)
+def init_pipeline(model, mode, device, dtype, alt_vae="none"):
+    model_downlod(model_name="JunhaoZhuang/"+model)
+    model_path = os.path.join(folder_paths.models_dir, model)
     if not os.path.exists(model_path):
         raise RuntimeError(f'Model directory does not exist!\nPlease save all weights to "{model_path}"')
     ckpt_path = os.path.join(model_path, "diffusion_pytorch_model_streaming_dmd.safetensors")
@@ -178,7 +175,7 @@ def init_pipeline(version, mode, device, dtype, alt_vae="none"):
         mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device), strict=False)
         pipe.TCDecoder.clean_mem()
     
-    if version == "1.0":
+    if model == "FlashVSR":
         pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
     else:
         pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
@@ -335,7 +332,7 @@ class FlashVSRNodeInitPipe:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "version": (["1.0", "1.1"], {
+                "model": (["FlashVSR", "FlashVSR-v1.1"], {
                     "default": "1.0",
                     "tooltip": "Model version."
                 }),
@@ -372,7 +369,7 @@ class FlashVSRNodeInitPipe:
     CATEGORY = "FlashVSR"
     DESCRIPTION = 'Download the entire "FlashVSR" folder with all the files inside it from "https://huggingface.co/JunhaoZhuang/FlashVSR" and put it in the "ComfyUI/models"'
     
-    def main(self, version, mode, alt_vae, force_offload, precision, device, attention_mode):
+    def main(self, model, mode, alt_vae, force_offload, precision, device, attention_mode):
         _device = device
         if device == "auto":
             _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
@@ -397,7 +394,7 @@ class FlashVSRNodeInitPipe:
         except:
             dtype = torch.bfloat16
             
-        pipe = init_pipeline(version, mode, _device, dtype, alt_vae=alt_vae)
+        pipe = init_pipeline(model, mode, _device, dtype, alt_vae=alt_vae)
         return((pipe, force_offload),)
 
 class FlashVSRNodeAdv:
@@ -494,7 +491,7 @@ class FlashVSRNode:
                 "frames": ("IMAGE", {
                     "tooltip": "Sequential video frames as IMAGE tensor batch"
                 }),
-                "version": (["1.0", "1.1"], {
+                "model": (["FlashVSR", "FlashVSR-v1.1"], {
                     "default": "1.0",
                     "tooltip": "Model version."
                 }),
@@ -533,13 +530,13 @@ class FlashVSRNode:
     CATEGORY = "FlashVSR"
     DESCRIPTION = 'Download the entire "FlashVSR" folder with all the files inside it from "https://huggingface.co/JunhaoZhuang/FlashVSR" and put it in the "ComfyUI/models"'
     
-    def main(self, version, frames, mode, scale, tiled_vae, tiled_dit, unload_dit, seed):
+    def main(self, model, frames, mode, scale, tiled_vae, tiled_dit, unload_dit, seed):
         wan_video_dit.USE_BLOCK_ATTN = False
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "auto"
         if _device == "auto" or _device not in device_choices:
             raise RuntimeError("No devices found to run FlashVSR!")
             
-        pipe = init_pipeline(version, mode, _device, torch.float16)
+        pipe = init_pipeline(model, mode, _device, torch.float16)
         output = flashvsr(pipe, frames, scale, True, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, True)
         return(output,)
 
