@@ -253,10 +253,9 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
         
     if tiled_dit:
         N, H, W, C = _frames.shape
-        num_aligned_frames = largest_8n1_leq(N + 4) - 4
         
         final_output_canvas = torch.zeros(
-            (num_aligned_frames, H * scale, W * scale, C), 
+            (N, H * scale, W * scale, C), 
             dtype=dtype, 
             device="cpu"
         )
