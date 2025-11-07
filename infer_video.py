@@ -14,16 +14,19 @@ from typing import List, Tuple, Optional
 import uuid
 import time
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
+# 将项目根目录添加到 sys.path，而不是 src 目录
+_project_root = os.path.dirname(os.path.abspath(__file__))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 # ====== FlashVSR modules ======
-from models.model_manager import ModelManager
-from models.TCDecoder import build_tcdecoder
-from models.utils import Buffer_LQ4x_Proj, clean_vram
-from models import wan_video_dit
-from pipelines.flashvsr_full import FlashVSRFullPipeline
-from pipelines.flashvsr_tiny import FlashVSRTinyPipeline
-from pipelines.flashvsr_tiny_long import FlashVSRTinyLongPipeline
+from src.models.model_manager import ModelManager
+from src.models.TCDecoder import build_tcdecoder
+from src.models.utils import Buffer_LQ4x_Proj, clean_vram
+from src.models import wan_video_dit
+from src.pipelines.flashvsr_full import FlashVSRFullPipeline
+from src.pipelines.flashvsr_tiny import FlashVSRTinyPipeline
+from src.pipelines.flashvsr_tiny_long import FlashVSRTinyLongPipeline
 
 # ==============================================================
 #                      Utility Functions
@@ -216,50 +219,339 @@ def pad_or_crop_video(frames):
     return frames
 
 def save_video(frames, path, fps=30):
-    """Save tensor video frames to MP4 - frames is (F, H, W, C) format."""
+    """Save tensor video frames to MP4 with H.264 encoding for Windows compatibility.
+    
+    Priority: FFmpeg subprocess (H.264) > torchvision.io.write_video > OpenCV with H.264 > OpenCV with mp4v
+    frames is (F, H, W, C) format.
+    """
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-    # frames is (F, H, W, C), convert to numpy
+    
+    # Convert frames to numpy for all methods
     frames_np = (frames.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
     h, w = frames_np.shape[1:3]
-    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-    for f in frames_np:
-        writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
-    writer.release()
+    num_frames = frames_np.shape[0]
+    
+    # Method 1: Try FFmpeg subprocess (most reliable, guaranteed H.264)
+    try:
+        import subprocess
+        import tempfile
+        
+        # Write frames to temporary raw video file
+        with tempfile.NamedTemporaryFile(suffix='.yuv', delete=False) as tmp_yuv:
+            tmp_yuv_path = tmp_yuv.name
+            # Write raw RGB24 frames
+            for f in frames_np:
+                tmp_yuv.write(f.tobytes())
+        
+        # Use FFmpeg to encode with H.264
+        cmd = [
+            'ffmpeg',
+            '-y',  # Overwrite output file
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-s', f'{w}x{h}',
+            '-pix_fmt', 'rgb24',
+            '-r', str(fps),
+            '-i', tmp_yuv_path,
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart',
+            '-crf', '18',  # High quality
+            path
+        ]
+        
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False
+        )
+        
+        # Clean up temp file
+        try:
+            os.unlink(tmp_yuv_path)
+        except:
+            pass
+        
+        if result.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
+            log(f"[save_video] Successfully saved video using FFmpeg (H.264): {path}", "info")
+            return
+        else:
+            log(f"[save_video] FFmpeg failed: {result.stderr.decode('utf-8', errors='ignore')[:200]}", "warning")
+    except FileNotFoundError:
+        log("[save_video] FFmpeg not found, trying torchvision...", "warning")
+    except Exception as e:
+        log(f"[save_video] FFmpeg subprocess failed: {e}, trying torchvision...", "warning")
+    
+    # Method 2: Try torchvision.io.write_video (uses H.264, best Windows compatibility)
+    try:
+        # frames is (F, H, W, C), convert to (F, C, H, W) for torchvision
+        frames_torch = frames.permute(0, 3, 1, 2).clamp(0, 1)  # (F, C, H, W)
+        frames_torch = (frames_torch * 255).byte().cpu()
+        
+        # Verify shape is correct: should be (F, C, H, W)
+        if len(frames_torch.shape) != 4 or frames_torch.shape[1] != 3:
+            raise ValueError(f"Invalid tensor shape for torchvision: {frames_torch.shape}, expected (F, 3, H, W)")
+        
+        # torchvision.io.write_video uses H.264 codec by default
+        # Note: Some versions may not support video_codec parameter, so we try without it first
+        try:
+            torchvision.io.write_video(
+                path,
+                frames_torch,
+                fps=fps,
+                video_codec='h264',
+                options={'pix_fmt': 'yuv420p', 'movflags': 'faststart'}
+            )
+        except (TypeError, RuntimeError) as e:
+            # Fallback for versions that don't support video_codec parameter
+            try:
+                torchvision.io.write_video(path, frames_torch, fps=fps)
+            except Exception as e2:
+                raise e2 from e
+        
+        # Verify file was created
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            log(f"[save_video] Successfully saved video using torchvision (H.264): {path}", "info")
+            return
+        else:
+            log(f"[save_video] torchvision created empty file, falling back", "warning")
+    except Exception as e:
+        log(f"[save_video] torchvision.write_video failed: {e}, falling back to OpenCV", "warning")
+    
+    # Method 3: Try OpenCV with H.264 codec (frames_np already converted above)
+    
+    # Try different H.264 fourcc codes for better compatibility
+    h264_codecs = [
+        ('avc1', 'H.264/AVC1 (best Windows compatibility)'),
+        ('H264', 'H.264 (alternative)'),
+        ('mp4v', 'MPEG-4 Part 2 (fallback, may not work on Windows)')
+    ]
+    
+    for fourcc_str, description in h264_codecs:
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+            writer = cv2.VideoWriter(path, fourcc, fps, (w, h))
+            
+            if not writer.isOpened():
+                log(f"[save_video] OpenCV failed to open writer with {fourcc_str}", "warning")
+                continue
+            
+            for f in frames_np:
+                writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+            writer.release()
+            
+            # Verify file was created and has content
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                log(f"[save_video] Successfully saved video using OpenCV ({description}): {path}", "info")
+                return
+            else:
+                log(f"[save_video] File created but empty with {fourcc_str}, trying next codec", "warning")
+        except Exception as e:
+            log(f"[save_video] OpenCV with {fourcc_str} failed: {e}, trying next codec", "warning")
+            if 'writer' in locals():
+                writer.release()
+    
+    raise RuntimeError(f"[save_video] All methods failed to save video: {path}")
 
 def read_video_to_tensor(video_path):
     """Read video and convert to (N, H, W, C) format for prepare_input_tensor.
+    
+    Returns: (frames_tensor, fps)
+    - frames_tensor: (N, H, W, C) format
+    - fps: float, frames per second
 
     Primary backend: torchvision.io.read_video (ffmpeg-based)
-    Fallback: OpenCV VideoCapture (handles many H.264/H.265 cases in containers)
+    Fallback 1: OpenCV VideoCapture with different backends
+    Fallback 2: FFmpeg via subprocess (most compatible)
     """
+    # 首先检查文件是否存在和可读
+    if not os.path.exists(video_path):
+        raise RuntimeError(f"[read_video] Video file does not exist: {video_path}")
+    if not os.path.isfile(video_path):
+        raise RuntimeError(f"[read_video] Path is not a file: {video_path}")
+    if not os.access(video_path, os.R_OK):
+        raise RuntimeError(f"[read_video] Video file is not readable: {video_path}")
+    
+    file_size = os.path.getsize(video_path)
+    log(f"[read_video] Attempting to read video: {video_path} (size: {file_size / (1024*1024):.2f} MB)", "info")
+    
+    # Method 1: Try torchvision.io.read_video
     try:
-        vr = torchvision.io.read_video(video_path, pts_unit='sec')[0]
+        video_data = torchvision.io.read_video(video_path, pts_unit='sec')
+        vr = video_data[0]
+        # video_data[1] is audio, video_data[2] is info dict
+        info = video_data[2] if len(video_data) > 2 else {}
+        # Get fps from info dict or use default
+        if isinstance(info, dict):
+            fps = info.get('video_fps', 30.0)
+        else:
+            fps = 30.0  # Default if info is not a dict
+        
         if vr.numel() > 0 and vr.shape[0] > 0:
             vr = vr.permute(0, 3, 1, 2).float() / 255.0  # (N, C, H, W)
-            return vr.permute(0, 2, 3, 1)  # (N, H, W, C)
+            log(f"[read_video] Successfully read {vr.shape[0]} frames using torchvision (fps: {fps:.2f})", "info")
+            return vr.permute(0, 2, 3, 1), fps  # (N, H, W, C), fps
         else:
             log(f"[read_video] torchvision returned empty tensor for: {video_path}", "warning")
     except Exception as e:
         log(f"[read_video] torchvision read_video failed: {e}", "warning")
 
-    # Fallback to OpenCV
+    # Method 2: Try OpenCV VideoCapture with different backends
     log("[read_video] Falling back to OpenCV VideoCapture...", "warning")
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video: {video_path}")
-    frames = []
-    while True:
-        ret, frame_bgr = cap.read()
-        if not ret:
-            break
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        frames.append(torch.from_numpy(frame_rgb).float() / 255.0)
-    cap.release()
-
-    if len(frames) == 0:
-        raise RuntimeError(f"[read_video] No frames decoded from: {video_path}")
-    vr = torch.stack(frames, dim=0)  # (N,H,W,C)
-    return vr
+    
+    # Try different OpenCV backends for better compatibility
+    backends_to_try = [
+        cv2.CAP_FFMPEG,  # FFmpeg backend (most compatible)
+        cv2.CAP_ANY,     # Auto-detect
+    ]
+    
+    cap = None
+    for backend in backends_to_try:
+        try:
+            cap = cv2.VideoCapture(video_path, backend)
+            if cap.isOpened():
+                # Verify we can actually read frames
+                ret, _ = cap.read()
+                if ret:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to beginning
+                    log(f"[read_video] OpenCV opened video with backend: {backend}", "info")
+                    break
+            if cap:
+                cap.release()
+                cap = None
+        except Exception as e:
+            log(f"[read_video] OpenCV backend {backend} failed: {e}", "warning")
+            if cap:
+                cap.release()
+                cap = None
+    
+    if cap and cap.isOpened():
+        # Get video properties
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0 or fps > 1000:  # Sanity check
+            fps = 30.0
+        
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Validate frame count (some codecs return invalid values)
+        if frame_count <= 0 or frame_count > 1000000:
+            log(f"[read_video] OpenCV reported invalid frame count ({frame_count}), will count by reading", "warning")
+            frame_count = -1  # Will count by reading
+        
+        log(f"[read_video] OpenCV video info: {frame_count if frame_count > 0 else 'unknown'} frames, {width}x{height}, {fps:.2f} fps", "info")
+        
+        frames = []
+        frame_idx = 0
+        while True:
+            ret, frame_bgr = cap.read()
+            if not ret:
+                if frame_idx == 0:
+                    log(f"[read_video] OpenCV could not read any frames", "warning")
+                break
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frames.append(torch.from_numpy(frame_rgb).float() / 255.0)
+            frame_idx += 1
+        
+        cap.release()
+        
+        if len(frames) > 0:
+            # Update fps if we have actual frame count
+            if frame_count <= 0 and len(frames) > 0:
+                # Try to estimate fps from duration if available
+                pass  # Keep the fps from CAP_PROP_FPS
+            log(f"[read_video] Successfully read {len(frames)} frames using OpenCV (fps: {fps:.2f})", "info")
+            vr = torch.stack(frames, dim=0)  # (N,H,W,C)
+            return vr, fps
+    
+    # Method 3: Try FFmpeg via subprocess (most reliable fallback)
+    log("[read_video] Falling back to FFmpeg subprocess...", "warning")
+    try:
+        import subprocess
+        import tempfile
+        import numpy as np
+        
+        # Create temporary directory for frames
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Use FFmpeg to extract frames as raw RGB images
+            # FFmpeg command: extract frames as raw RGB24 (packed)
+            cmd = [
+                'ffmpeg', '-i', video_path,
+                '-f', 'rawvideo',
+                '-pix_fmt', 'rgb24',
+                '-'
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False
+            )
+            
+            if result.returncode == 0 and len(result.stdout) > 0:
+                # Parse FFmpeg output to get video dimensions
+                # Try to get dimensions from stderr or use ffprobe
+                probe_cmd = [
+                    'ffprobe', '-v', 'error',
+                    '-select_streams', 'v:0',
+                    '-show_entries', 'stream=width,height,r_frame_rate',
+                    '-of', 'default=noprint_wrappers=1:nokey=1',
+                    video_path
+                ]
+                
+                probe_result = subprocess.run(
+                    probe_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                
+                if probe_result.returncode == 0:
+                    lines = probe_result.stdout.strip().split('\n')
+                    width = int(lines[0]) if len(lines) > 0 and lines[0].isdigit() else 1920
+                    height = int(lines[1]) if len(lines) > 1 and lines[1].isdigit() else 1080
+                    # Parse fps from r_frame_rate (format: "30/1" or "29.97/1")
+                    fps_str = lines[2] if len(lines) > 2 else "30/1"
+                    try:
+                        if '/' in fps_str:
+                            num, den = map(float, fps_str.split('/'))
+                            fps = num / den if den > 0 else 30.0
+                        else:
+                            fps = float(fps_str) if fps_str.replace('.', '').isdigit() else 30.0
+                    except:
+                        fps = 30.0
+                    
+                    # Parse raw video data
+                    frame_size = width * height * 3
+                    num_frames = len(result.stdout) // frame_size
+                    
+                    if num_frames > 0:
+                        frames_data = np.frombuffer(result.stdout[:num_frames * frame_size], dtype=np.uint8)
+                        frames_data = frames_data.reshape(num_frames, height, width, 3)
+                        
+                        frames = [torch.from_numpy(frame).float() / 255.0 for frame in frames_data]
+                        log(f"[read_video] Successfully read {len(frames)} frames using FFmpeg subprocess (fps: {fps:.2f})", "info")
+                        vr = torch.stack(frames, dim=0)  # (N,H,W,C)
+                        return vr, fps
+    except FileNotFoundError:
+        log("[read_video] FFmpeg not found in PATH", "warning")
+    except Exception as e:
+        log(f"[read_video] FFmpeg subprocess failed: {e}", "warning")
+    
+    # All methods failed
+    error_msg = f"[read_video] All methods failed to read video: {video_path}\n"
+    error_msg += f"  - File exists: {os.path.exists(video_path)}\n"
+    error_msg += f"  - File readable: {os.access(video_path, os.R_OK)}\n"
+    error_msg += f"  - File size: {file_size} bytes ({file_size / (1024*1024):.2f} MB)\n"
+    error_msg += "\nPossible causes:\n"
+    error_msg += "  1. Unsupported video codec/container format\n"
+    error_msg += "  2. Corrupted video file\n"
+    error_msg += "  3. Missing codec support (try installing: apt-get install -y ffmpeg libavcodec-dev)\n"
+    error_msg += "  4. Very low frame rate or unusual encoding parameters\n"
+    raise RuntimeError(error_msg)
 
 def split_video_by_frames(frames: torch.Tensor, num_gpus: int, overlap: int = 10):
     N = frames.shape[0]
@@ -480,8 +772,9 @@ def _worker_process(worker_id: int, device: str, video_path: str,
         # 重新导入必要的模块（在子进程中）
         import os
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        sys.path.insert(0, script_dir)
-        sys.path.insert(0, os.path.join(script_dir, "src"))
+        # 将项目根目录添加到 sys.path，而不是 src 目录（与主文件保持一致）
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
         
         report_progress("INIT", "Importing modules...")
         
@@ -495,16 +788,16 @@ def _worker_process(worker_id: int, device: str, video_path: str,
         args = Namespace(**args_dict)
         args.device = device
         
-        # 导入必要的模块
+        # 导入必要的模块（使用 src. 前缀，与主文件保持一致）
         report_progress("LOAD", "Loading model modules...")
-        from models.utils import clean_vram
-        from models import wan_video_dit
-        from models.model_manager import ModelManager
-        from models.TCDecoder import build_tcdecoder
-        from models.utils import Buffer_LQ4x_Proj
-        from pipelines.flashvsr_full import FlashVSRFullPipeline
-        from pipelines.flashvsr_tiny import FlashVSRTinyPipeline
-        from pipelines.flashvsr_tiny_long import FlashVSRTinyLongPipeline
+        from src.models.utils import clean_vram
+        from src.models import wan_video_dit
+        from src.models.model_manager import ModelManager
+        from src.models.TCDecoder import build_tcdecoder
+        from src.models.utils import Buffer_LQ4x_Proj
+        from src.pipelines.flashvsr_full import FlashVSRFullPipeline
+        from src.pipelines.flashvsr_tiny import FlashVSRTinyPipeline
+        from src.pipelines.flashvsr_tiny_long import FlashVSRTinyLongPipeline
         
         # 处理attention_mode
         if args.attention_mode == "sparse_sage_attention":
@@ -515,11 +808,31 @@ def _worker_process(worker_id: int, device: str, video_path: str,
         # 初始化pipeline
         report_progress("LOAD", "Initializing pipeline...")
         model_path = args.model_dir
+        
+        # 验证模型路径和文件
+        if not os.path.exists(model_path):
+            raise RuntimeError(f"[Worker {worker_id}] Model directory does not exist: {model_path}")
+        if not os.path.isdir(model_path):
+            raise RuntimeError(f"[Worker {worker_id}] Model path is not a directory: {model_path}")
+        
         ckpt_path = os.path.join(model_path, "diffusion_pytorch_model_streaming_dmd.safetensors")
         vae_path = os.path.join(model_path, "Wan2.1_VAE.pth")
         lq_path = os.path.join(model_path, "LQ_proj_in.ckpt")
         tcd_path = os.path.join(model_path, "TCDecoder.ckpt")
         prompt_path = os.path.join(script_dir, "posi_prompt.pth")
+        
+        # 验证必需的文件是否存在
+        required_files = [ckpt_path]
+        if args.mode == "full":
+            required_files.append(vae_path)
+        else:
+            required_files.extend([lq_path, tcd_path])
+        
+        missing_files = [f for f in required_files if not os.path.exists(f)]
+        if missing_files:
+            raise RuntimeError(f"[Worker {worker_id}] Missing required model files:\n  " + "\n  ".join(missing_files))
+        
+        report_progress("LOAD", f"Model directory: {model_path} (verified)")
         
         dtype_map = {
             "fp32": torch.float32,
@@ -556,7 +869,7 @@ def _worker_process(worker_id: int, device: str, video_path: str,
 
         # 读取视频并裁剪到该段
         from infer_video import read_video_to_tensor, run_inference
-        frames_all = read_video_to_tensor(video_path)
+        frames_all, input_fps = read_video_to_tensor(video_path)
         # Clamp indices to avoid empty or negative-length segments
         N = frames_all.shape[0]
         start = max(0, min(start_idx, N))
@@ -708,18 +1021,18 @@ def process_tile_batch(pipe, frames, device, dtype, args, tile_batch: List[Tuple
     """Process a batch of tiles and return results."""
     N, H, W, C = frames.shape
     num_aligned_frames = largest_8n1_leq(N + 4) - 4
-    
+
     results = []
     
     for tile_idx, (x1, y1, x2, y2) in enumerate(tile_batch):
         input_tile = frames[:, y1:y2, x1:x2, :]
-        
+
         LQ_tile, th, tw, F = prepare_input_tensor(input_tile, device, scale=args.scale, dtype=dtype)
         if "long" not in args.mode:
             LQ_tile = LQ_tile.to(device)
-        
+
         topk_ratio = args.sparse_ratio * 768 * 1280 / (th * tw)
-        
+
         with torch.no_grad():
             output_tile = pipe(
                 prompt="",
@@ -740,9 +1053,9 @@ def process_tile_batch(pipe, frames, device, dtype, args, tile_batch: List[Tuple
                 color_fix=args.color_fix,
                 unload_dit=args.unload_dit,
             )
-        
+
         processed_tile_cpu = tensor2video(output_tile).to("cpu")
-        
+
         mask_nchw = create_feather_mask(
             (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
             args.tile_overlap * args.scale,
@@ -806,6 +1119,10 @@ def run_inference(pipe, frames, device, dtype, args):
     # 基本输入校验
     if frames is None or not hasattr(frames, 'shape') or frames.ndim != 4 or frames.shape[0] == 0:
         raise RuntimeError("[run_inference] Input frames is empty. Please check video decoding and path.")
+    
+    # 保存原始帧数（用于最后裁剪）
+    N_original = frames.shape[0]
+    
     # 确保最少 21 帧（便于首尾填充）
     if frames.shape[0] < 21:
         add = 21 - frames.shape[0]
@@ -846,18 +1163,18 @@ def run_inference(pipe, frames, device, dtype, args):
                 x1, y1, x2, y2 = result['coords']
                 processed_tile_cpu = result['tile']
                 mask_nhwc = result['mask']
-                
+
                 out_x1, out_y1 = x1 * args.scale, y1 * args.scale
                 tile_H_scaled = processed_tile_cpu.shape[1]
                 tile_W_scaled = processed_tile_cpu.shape[2]
                 out_x2, out_y2 = out_x1 + tile_W_scaled, out_y1 + tile_H_scaled
-                
+
                 final_output_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += processed_tile_cpu * mask_nhwc
                 weight_sum_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += mask_nhwc
-                
+
                 processed += 1
                 log(f"[FlashVSR] Processed tile {processed}/{total_tiles}: ({x1},{y1})-({x2},{y2})", "info")
-            
+                
             # 每次batch后清理显存
             clean_vram()
             
@@ -870,6 +1187,11 @@ def run_inference(pipe, frames, device, dtype, args):
 
         weight_sum_canvas[weight_sum_canvas == 0] = 1.0
         final_output = final_output_canvas / weight_sum_canvas
+        
+        # 裁剪回原始帧数（对齐可能增加了帧数）
+        if final_output.shape[0] > N_original:
+            final_output = final_output[:N_original]
+        
         return final_output
 
     # 整图路径
@@ -905,6 +1227,11 @@ def run_inference(pipe, frames, device, dtype, args):
         output = output[0]
 
     final_output = tensor2video(output).to("cpu")
+    
+    # 裁剪回原始帧数（对齐可能增加了帧数）
+    if final_output.shape[0] > N_original:
+        final_output = final_output[:N_original]
+    
     del output, LQ
     clean_vram()
     return final_output
@@ -936,14 +1263,14 @@ def main(args):
                 wan_video_dit.USE_BLOCK_ATTN = True
             
             # 读取视频
-            frames = read_video_to_tensor(args.input)
+            frames, input_fps = read_video_to_tensor(args.input)
             
             # 使用多GPU处理
             output = run_inference_multi_gpu(frames, devices, args)
             
-            # 保存视频
-            output_dir = args.output if args.output else os.path.join("results", os.path.basename(args.input).replace(".mp4", "_out.mp4"))
-            save_video(output, output_dir)
+            # 保存视频（使用原始FPS）
+            output_dir = args.output if args.output else os.path.join("/app/output", os.path.basename(args.input).replace(".mp4", "_out.mp4"))
+            save_video(output, output_dir, fps=input_fps)
             
             del frames, output
             clean_vram()
@@ -981,13 +1308,13 @@ def main(args):
     dtype = dtype_map.get(args.precision, torch.bfloat16)
     
     pipe = init_pipeline(args.mode, _device, dtype, args.model_dir)
-    frames = read_video_to_tensor(args.input)
+    frames, input_fps = read_video_to_tensor(args.input)
     
     output = run_inference(pipe, frames, _device, dtype, args)
     
-    # 保存视频
-    output_dir = args.output if args.output else os.path.join("results", os.path.basename(args.input).replace(".mp4", "_out.mp4"))
-    save_video(output, output_dir)
+    # 保存视频（使用原始FPS）
+    output_dir = args.output if args.output else os.path.join("/app/output", os.path.basename(args.input).replace(".mp4", "_out.mp4"))
+    save_video(output, output_dir, fps=input_fps)
     
     del pipe, frames, output
     clean_vram()
@@ -1000,7 +1327,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FlashVSR Standalone Inference with Optimizations")
     parser.add_argument("--input", type=str, required=True, help="Input video path")
     parser.add_argument("--output", type=str, default=None, help="Output video path")
-    parser.add_argument("--model_dir", type=str, default="/app/FlashVSR/examples/WanVSR/FlashVSR", help="Model directory")
+    parser.add_argument("--model_dir", type=str, default="/app/models", help="Model directory")
     parser.add_argument("--mode", type=str, default="tiny", choices=["tiny", "full", "tiny-long"], help="Model mode")
     parser.add_argument("--device", type=str, default="cuda:0", choices=get_device_list(), help="Device (ignored if --multi_gpu is used)")
     

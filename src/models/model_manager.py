@@ -113,8 +113,10 @@ class ModelDetectorFromSingleFile:
     def match(self, file_path="", state_dict={}):
         if isinstance(file_path, str) and os.path.isdir(file_path):
             return False
-        if len(state_dict) == 0:
+        if state_dict is None or len(state_dict) == 0:
             state_dict = load_state_dict(file_path)
+            if state_dict is None:
+                return False
         keys_hash_with_shape = hash_state_dict_keys(state_dict, with_shape=True)
         if keys_hash_with_shape in self.keys_hash_with_shape_dict:
             return True
