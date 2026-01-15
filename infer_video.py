@@ -13,6 +13,9 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from typing import List, Tuple, Optional
 import uuid
 import time
+import hashlib
+import json
+import glob
 
 # 将项目根目录添加到 sys.path，而不是 src 目录
 _project_root = os.path.dirname(os.path.abspath(__file__))
@@ -137,7 +140,8 @@ def log(message: str, message_type: str = 'normal'):
         message = '\033[1;32m' + message + '\033[m'
     elif message_type == 'info':
         message = '\033[1;33m' + message + '\033[m'
-    print(message)
+     # 确保换行并刷新输出，避免与 tqdm 进度条冲突
+    print(message, flush=True)
 
 def format_duration(seconds: float) -> str:
     """Format duration in seconds to human-readable string."""
@@ -227,14 +231,54 @@ def calculate_tile_coords(height, width, tile_size, overlap):
     return coords
 
 def create_feather_mask(size, overlap):
-    """Create blending mask for overlapping tiles."""
+    """Create blending mask for overlapping tiles with Gaussian blur for smoother blending.
+    
+    Args:
+        size: (H, W) tuple of mask dimensions
+        overlap: Overlap size in pixels (determined by user parameter)
+    
+    Returns:
+        mask: (1, 1, H, W) tensor with smooth blending weights
+    """
+    import torch.nn.functional as F
+    
     H, W = size
-    mask = torch.ones(1, 1, H, W)
-    ramp = torch.linspace(0, 1, overlap)
-    mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp.view(1, 1, 1, -1))
-    mask[:, :, :, -overlap:] = torch.minimum(mask[:, :, :, -overlap:], ramp.flip(0).view(1, 1, 1, -1))
-    mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp.view(1, 1, -1, 1))
-    mask[:, :, -overlap:, :] = torch.minimum(mask[:, :, -overlap:, :], ramp.flip(0).view(1, 1, -1, 1))
+    mask = torch.ones(1, 1, H, W, dtype=torch.float32)
+    
+    # 创建线性ramp作为基础
+    ramp = torch.linspace(0, 1, overlap, dtype=torch.float32)
+    
+    # 应用高斯模糊使过渡更平滑
+    # 使用1D高斯核，sigma约为overlap的1/3，使过渡更自然
+    sigma = max(1.0, overlap / 3.0)
+    kernel_size = int(2 * sigma * 2) + 1  # 确保是奇数
+    if kernel_size > 1 and kernel_size <= overlap:
+        # 创建1D高斯核
+        x = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
+        gaussian_1d = torch.exp(-0.5 * (x / sigma) ** 2)
+        gaussian_1d = gaussian_1d / gaussian_1d.sum()
+        
+        # 对ramp应用高斯模糊
+        ramp_padded = F.pad(ramp.unsqueeze(0).unsqueeze(0), (kernel_size//2, kernel_size//2), mode='reflect')
+        ramp_blurred = F.conv1d(ramp_padded, gaussian_1d.unsqueeze(0).unsqueeze(0), padding=0)
+        ramp = ramp_blurred.squeeze()
+        # 重新归一化到[0, 1]
+        if ramp.max() > ramp.min():
+            ramp = (ramp - ramp.min()) / (ramp.max() - ramp.min())
+    
+    # 应用ramp到四个边缘
+    ramp_h = ramp.view(1, 1, -1, 1)  # 用于垂直边缘
+    ramp_w = ramp.view(1, 1, 1, -1)  # 用于水平边缘
+    
+    # 左边缘
+    mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp_w)
+    # 右边缘
+    mask[:, :, :, -overlap:] = torch.minimum(mask[:, :, :, -overlap:], ramp_w.flip(-1))
+    # 上边缘
+    mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp_h)
+    # 下边缘
+    mask[:, :, -overlap:, :] = torch.minimum(mask[:, :, -overlap:, :], ramp_h.flip(-2))
+    
     return mask
 
 def pad_or_crop_video(frames):
@@ -388,6 +432,9 @@ def save_video(frames, path, fps=30):
     
     Priority: FFmpeg subprocess (H.264) > torchvision.io.write_video > OpenCV with H.264 > OpenCV with mp4v
     frames is (F, H, W, C) format.
+    
+    Returns:
+        True if video was successfully saved and verified, raises RuntimeError otherwise
     """
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
     
@@ -728,6 +775,115 @@ def split_video_by_frames(frames: torch.Tensor, num_gpus: int, overlap: int = 10
         segments.append((start_idx, end_idx))  # 仅返回区间
     return segments
 
+def merge_video_segments_streaming(segments_info: List[Tuple[int, int, str]], original_length: int) -> torch.Tensor:
+    """流式合并segments，逐个加载和处理，避免OOM。
+    
+    Args:
+        segments_info: List of (start_idx, end_idx, file_path) tuples，按start_idx排序
+        original_length: Original number of frames
+    
+    Returns:
+        Merged video tensor (F, H, W, C)
+    """
+    if not segments_info:
+        raise ValueError("No segments to merge")
+    
+    segments_info = sorted(segments_info, key=lambda x: x[0])  # 按start_idx排序
+    
+    merged_parts = []
+    last_expected_end_idx = 0  # 使用期望的end_idx来判断overlap和计算期望帧数
+    import gc
+    
+    for i, (start_idx, end_idx, path) in enumerate(segments_info):
+        log(f"[Multi-GPU] Loading segment {i+1}/{len(segments_info)} from {path}...", "info")
+        
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Segment file not found: {path}")
+        
+        # 检查文件大小
+        file_size = os.path.getsize(path)
+        file_size_gb = file_size / (1024**3)
+        log(f"[Multi-GPU] Segment {i+1} file size: {file_size_gb:.2f} GB", "info")
+        
+        # 加载segment
+        segment = torch.load(path, map_location='cpu')
+        log(f"[Multi-GPU] Loaded segment {i+1}: {segment.shape}", "info")
+        
+        # 处理overlap：跳过与上一个segment重叠的部分（基于期望的end_idx）
+        overlap_frames = 0
+        if last_expected_end_idx > 0 and start_idx < last_expected_end_idx:
+            overlap_frames = last_expected_end_idx - start_idx
+            if overlap_frames < segment.shape[0]:
+                segment = segment[overlap_frames:]
+                log(f"[Multi-GPU] Skipped {overlap_frames} overlap frames (start_idx={start_idx}, last_expected_end_idx={last_expected_end_idx})", "info")
+            elif overlap_frames >= segment.shape[0]:
+                log(f"[Multi-GPU] WARNING: Segment {i+1} is completely overlapped, skipping", "warning")
+                del segment
+                gc.collect()
+                last_expected_end_idx = end_idx  # 更新期望的结束位置
+                continue
+        
+        # 计算期望的帧数（考虑overlap，使用绝对帧索引）
+        if overlap_frames > 0:
+            # 如果处理了overlap，期望的帧数应该是从last_expected_end_idx到end_idx
+            expected_frames = end_idx - last_expected_end_idx
+        else:
+            # 如果没有overlap，期望的帧数就是end_idx - start_idx
+            expected_frames = end_idx - start_idx
+        
+        # 如果实际帧数不足，填充到期望的帧数
+        if segment.shape[0] < expected_frames:
+            missing_frames = expected_frames - segment.shape[0]
+            log(f"[Multi-GPU] Segment {i+1} frame count insufficient: actual {segment.shape[0]} frames, expected {expected_frames} frames", "warning")
+            log(f"[Multi-GPU] Padding {missing_frames} frames (using last frame)...", "info")
+            last_frame = segment[-1:, :, :, :]
+            padding_frames = last_frame.repeat(missing_frames, 1, 1, 1)
+            segment = torch.cat([segment, padding_frames], dim=0)
+            log(f"[Multi-GPU] Padding complete: {segment.shape[0]} frames", "info")
+        elif segment.shape[0] > expected_frames:
+            # 如果实际帧数超过期望，裁剪到期望的帧数
+            segment = segment[:expected_frames]
+            log(f"[Multi-GPU] Cropped to expected frame count: {segment.shape[0]} frames", "info")
+        
+        # 添加到合并列表
+        if segment.shape[0] > 0:
+            merged_parts.append(segment)
+            last_expected_end_idx = end_idx  # 更新期望的结束位置
+            
+            # 每处理2个segments就合并一次，释放内存（避免累积太多）
+            if len(merged_parts) >= 2:
+                log(f"[Multi-GPU] Merging {len(merged_parts)} parts to reduce memory...", "info")
+                merged = torch.cat(merged_parts, dim=0)
+                merged_parts = [merged]
+                # 注意：merged_parts中的旧tensor引用会自动被Python的GC处理
+                gc.collect()
+            # segment已经被添加到merged_parts，不需要手动删除
+        else:
+            # segment为空，直接删除
+            del segment
+            gc.collect()
+    
+    # 最终合并
+    if len(merged_parts) > 1:
+        log(f"[Multi-GPU] Final merge of {len(merged_parts)} parts...", "info")
+        final_output = torch.cat(merged_parts, dim=0)
+    elif len(merged_parts) == 1:
+        final_output = merged_parts[0]
+    else:
+        raise ValueError("No segments to merge")
+    
+    # 确保长度正确
+    if final_output.shape[0] > original_length:
+        final_output = final_output[:original_length]
+        log(f"[Multi-GPU] Trimmed to original length: {original_length}", "info")
+    elif final_output.shape[0] < original_length:
+        # 如果长度不够，重复最后一帧
+        log(f"[Multi-GPU] Padding to original length: {original_length} (current: {final_output.shape[0]})", "info")
+        last_frame = final_output[-1:].repeat(original_length - final_output.shape[0], 1, 1, 1)
+        final_output = torch.cat([final_output, last_frame], dim=0)
+    
+    return final_output
+
 def merge_video_segments(segments: List[Tuple[int, int, torch.Tensor]], original_length: int) -> torch.Tensor:
     """Merge processed video segments back into a single video.
     
@@ -799,6 +955,431 @@ def merge_video_segments(segments: List[Tuple[int, int, torch.Tensor]], original
     
     return merged
 
+# ==============================================================
+#                     Checkpoint Functions
+# ==============================================================
+
+def get_checkpoint_id(input_path, args, segments, num_gpus):
+    """生成检查点ID，基于输入视频路径和关键参数"""
+    # 获取文件的修改时间和大小，确保文件变化时检查点失效
+    try:
+        stat = os.stat(input_path)
+        file_info = (stat.st_mtime, stat.st_size)
+    except:
+        file_info = (0, 0)
+    
+    # 使用输入路径、参数、segments信息生成唯一ID
+    key_data = {
+        'input': os.path.abspath(input_path),
+        'file_info': file_info,
+        'scale': args.scale,
+        'mode': args.mode,
+        'tile_size': args.tile_size,
+        'tile_overlap': args.tile_overlap,
+        'tiled_dit': args.tiled_dit,
+        'tiled_vae': args.tiled_vae,
+        'segments': segments,
+        'num_gpus': num_gpus,
+        'original_frame_count': segments[-1][1] if segments else 0
+    }
+    key_str = json.dumps(key_data, sort_keys=True)
+    return hashlib.md5(key_str.encode()).hexdigest()
+
+def load_checkpoint(checkpoint_dir):
+    """加载检查点信息"""
+    checkpoint_file = os.path.join(checkpoint_dir, 'checkpoint.json')
+    if os.path.exists(checkpoint_file):
+        try:
+            with open(checkpoint_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            log(f"[Checkpoint] Failed to load checkpoint: {e}", "warning")
+            return None
+    return None
+
+def save_checkpoint(checkpoint_dir, checkpoint_data):
+    """保存检查点信息"""
+    try:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_file = os.path.join(checkpoint_dir, 'checkpoint.json')
+        with open(checkpoint_file, 'w') as f:
+            json.dump(checkpoint_data, f, indent=2)
+    except Exception as e:
+        log(f"[Checkpoint] Failed to save checkpoint: {e}", "warning")
+
+def find_completed_segments(checkpoint_dir, segments):
+    """查找已完成的segment"""
+    completed = {}
+    if not os.path.exists(checkpoint_dir):
+        return completed
+    
+    checkpoint_data = load_checkpoint(checkpoint_dir)
+    if not checkpoint_data:
+        return completed
+    
+    # 检查每个segment的结果文件是否存在
+    for i, (start_idx, end_idx) in enumerate(segments):
+        segment_key = f"segment_{i}_{start_idx}_{end_idx}"
+        if segment_key in checkpoint_data:
+            result_path = checkpoint_data[segment_key]['path']
+            if os.path.exists(result_path):
+                # 验证文件是否完整（检查文件大小）
+                try:
+                    file_size = os.path.getsize(result_path)
+                    if file_size > 0:  # 文件存在且非空
+                        completed[i] = checkpoint_data[segment_key]
+                        log(f"[Resume] Found completed segment {i} (frames {start_idx}-{end_idx}) at {result_path}", "info")
+                except:
+                    pass
+    
+    return completed
+
+def clean_checkpoint(checkpoint_dir):
+    """清理检查点目录"""
+    try:
+        if os.path.exists(checkpoint_dir):
+            import shutil
+            shutil.rmtree(checkpoint_dir)
+            log(f"[Checkpoint] Cleaned checkpoint directory: {checkpoint_dir}", "info")
+            return True
+    except Exception as e:
+        log(f"[Checkpoint] Failed to clean checkpoint: {e}", "warning")
+        return False
+    return False
+
+# ==============================================================
+#               Unified Checkpoint System (Frame-based)
+# ==============================================================
+
+def get_video_based_dir_name(input_path, scale):
+    """生成基于视频名称和放大倍数的目录名
+    
+    Args:
+        input_path: 输入视频路径
+        scale: 放大倍数
+    
+    Returns:
+        目录名，例如: "3D_cat_1080_4x"
+    """
+    # 获取视频文件名（不含扩展名）
+    video_basename = os.path.basename(input_path)
+    video_name = os.path.splitext(video_basename)[0]
+    
+    # 清理文件名中的特殊字符（避免目录名问题）
+    import re
+    video_name = re.sub(r'[^\w\-_\.]', '_', video_name)
+    
+    # 生成目录名
+    dir_name = f"{video_name}_{scale}x"
+    return dir_name
+
+def get_video_based_dir_name(input_path, scale):
+    """生成基于视频名称和放大倍数的目录名
+    
+    Args:
+        input_path: 输入视频路径
+        scale: 放大倍数
+    
+    Returns:
+        目录名，例如: "3D_cat_1080_4x"
+    """
+    # 获取视频文件名（不含扩展名）
+    video_basename = os.path.basename(input_path)
+    video_name = os.path.splitext(video_basename)[0]
+    
+    # 清理文件名中的特殊字符（避免目录名问题）
+    import re
+    video_name = re.sub(r'[^\w\-_\.]', '_', video_name)
+    
+    # 生成目录名
+    dir_name = f"{video_name}_{scale}x"
+    return dir_name
+
+def get_unified_checkpoint_id(input_path, args, total_frames):
+    """生成统一的checkpoint ID，不依赖处理模式，只基于输入视频和参数"""
+    try:
+        stat = os.stat(input_path)
+        file_info = (stat.st_mtime, stat.st_size)
+    except:
+        file_info = (0, 0)
+    
+    key_data = {
+        'input': os.path.abspath(input_path),
+        'file_info': file_info,
+        'scale': args.scale,
+        'mode': args.mode,
+        'tile_size': args.tile_size,
+        'tile_overlap': args.tile_overlap,
+        'tiled_dit': args.tiled_dit,
+        'tiled_vae': args.tiled_vae,
+        'total_frames': total_frames
+    }
+    key_str = json.dumps(key_data, sort_keys=True)
+    return hashlib.md5(key_str.encode()).hexdigest()
+
+def scan_all_completed_frames(input_path, args, total_frames):
+    """扫描所有checkpoint位置（multi_gpu和segmented），返回已完成的帧范围列表
+    
+    Returns:
+        List of tuples: [(start_frame, end_frame, file_path, mode), ...]
+        mode: 'multi_gpu' or 'segmented'
+    """
+    checkpoint_id = get_unified_checkpoint_id(input_path, args, total_frames)
+    completed_ranges = []  # [(start, end, file_path, mode), ...]
+    
+    # 1. 扫描 multi_gpu checkpoint
+    multi_gpu_base_dir = os.path.join('/tmp', 'flashvsr_checkpoints')
+    if os.path.exists(multi_gpu_base_dir):
+        # 优先使用基于视频名称的目录
+        video_dir_name = get_video_based_dir_name(input_path, args.scale)
+        checkpoint_path = os.path.join(multi_gpu_base_dir, video_dir_name)
+        
+        if os.path.exists(checkpoint_path) and os.path.isdir(checkpoint_path):
+            checkpoint_data = load_checkpoint(checkpoint_path)
+            if checkpoint_data:
+                for key, value in checkpoint_data.items():
+                    if key.startswith('segment_') and isinstance(value, dict):
+                        if 'start_idx' in value and 'end_idx' in value and 'path' in value:
+                            start = value['start_idx']
+                            end = value['end_idx']
+                            path = value['path']
+                            if os.path.exists(path):
+                                try:
+                                    file_size = os.path.getsize(path)
+                                    if file_size > 0:
+                                        completed_ranges.append((start, end, path, 'multi_gpu'))
+                                except:
+                                    pass
+        
+        # 向后兼容：遍历所有checkpoint目录，查找匹配的（旧格式）
+        for checkpoint_dir in os.listdir(multi_gpu_base_dir):
+            checkpoint_path = os.path.join(multi_gpu_base_dir, checkpoint_dir)
+            if not os.path.isdir(checkpoint_path):
+                continue
+            # 跳过已经检查过的目录
+            if checkpoint_dir == video_dir_name:
+                continue
+            
+            checkpoint_data = load_checkpoint(checkpoint_path)
+            if not checkpoint_data:
+                continue
+            
+            # 检查是否匹配当前输入和参数
+            # 通过检查checkpoint中的segment信息来判断
+            for key, value in checkpoint_data.items():
+                if key.startswith('segment_') and isinstance(value, dict):
+                    if 'start_idx' in value and 'end_idx' in value and 'path' in value:
+                        start = value['start_idx']
+                        end = value['end_idx']
+                        path = value['path']
+                        if os.path.exists(path):
+                            try:
+                                file_size = os.path.getsize(path)
+                                if file_size > 0:
+                                    completed_ranges.append((start, end, path, 'multi_gpu'))
+                            except:
+                                pass
+    
+    # 2. 扫描 segmented checkpoint
+    segmented_base_dir = os.path.join('/tmp', 'flashvsr_segments')
+    if os.path.exists(segmented_base_dir):
+        # 优先使用基于视频名称的目录
+        video_dir_name = get_video_based_dir_name(input_path, args.scale)
+        segment_dir = os.path.join(segmented_base_dir, video_dir_name)
+        
+        if os.path.exists(segment_dir) and os.path.isdir(segment_dir):
+            segment_files = sorted(glob.glob(os.path.join(segment_dir, "segment_*.pt")))
+            if segment_files:
+                # 处理这个目录的segments
+                for seg_file in segment_files:
+                    if os.path.getsize(seg_file) == 0:
+                        continue
+                    
+                    # 查找对应的metadata文件
+                    basename = os.path.basename(seg_file)
+                    metadata_file = os.path.join(segment_dir, basename.replace('.pt', '.json'))
+                    
+                    if os.path.exists(metadata_file):
+                        # 从metadata文件读取帧范围
+                        try:
+                            with open(metadata_file, 'r') as f:
+                                metadata = json.load(f)
+                            start_frame = metadata.get('start_frame', 0)
+                            end_frame = metadata.get('end_frame', 0)
+                            if start_frame < end_frame and end_frame <= total_frames:
+                                completed_ranges.append((start_frame, end_frame, seg_file, 'segmented'))
+                        except:
+                            pass
+        
+        # 向后兼容：遍历所有segment目录（旧格式）
+        for segment_dir_name in os.listdir(segmented_base_dir):
+            segment_dir = os.path.join(segmented_base_dir, segment_dir_name)
+            if not os.path.isdir(segment_dir):
+                continue
+            # 跳过已经检查过的目录
+            if segment_dir_name == video_dir_name:
+                continue
+            
+            segment_files = sorted(glob.glob(os.path.join(segment_dir, "segment_*.pt")))
+            if not segment_files:
+                continue
+            
+            # 从metadata文件读取帧范围信息（更准确）
+            for seg_file in segment_files:
+                if os.path.getsize(seg_file) == 0:
+                    continue
+                
+                # 查找对应的metadata文件
+                basename = os.path.basename(seg_file)
+                metadata_file = os.path.join(segment_dir, basename.replace('.pt', '.json'))
+                
+                if os.path.exists(metadata_file):
+                    # 从metadata文件读取帧范围
+                    try:
+                        with open(metadata_file, 'r') as f:
+                            metadata = json.load(f)
+                        start_frame = metadata.get('start_frame', 0)
+                        end_frame = metadata.get('end_frame', 0)
+                        if start_frame < end_frame and end_frame <= total_frames:
+                            completed_ranges.append((start_frame, end_frame, seg_file, 'segmented'))
+                    except:
+                        pass
+                else:
+                    # 如果没有metadata文件，尝试从文件名和文件内容推断（向后兼容）
+                    try:
+                        seg_idx = int(basename[8:12])  # segment_0000 -> 0000
+                        seg = torch.load(seg_file, map_location='cpu')
+                        actual_frames = seg.shape[0]
+                        segment_overlap = getattr(args, 'segment_overlap', 2)
+                        
+                        # 粗略估算：假设每个segment大约100帧（实际值可能不同）
+                        # 这是向后兼容的估算方法
+                        estimated_start = seg_idx * 100
+                        estimated_end = estimated_start + actual_frames
+                        if estimated_end <= total_frames and estimated_start < estimated_end:
+                            completed_ranges.append((estimated_start, estimated_end, seg_file, 'segmented'))
+                        del seg
+                    except:
+                        pass
+    
+    # 3. 合并重叠的帧范围并去重
+    if not completed_ranges:
+        return []
+    
+    # 按start_frame排序
+    completed_ranges.sort(key=lambda x: x[0])
+    
+    # 合并重叠范围
+    merged_ranges = []
+    for start, end, path, mode in completed_ranges:
+        if merged_ranges and start <= merged_ranges[-1][1]:
+            # 有重叠，合并（取更大的end）
+            prev_start, prev_end, prev_path, prev_mode = merged_ranges[-1]
+            merged_ranges[-1] = (prev_start, max(prev_end, end), prev_path, prev_mode)
+        else:
+            merged_ranges.append((start, end, path, mode))
+    
+    return merged_ranges
+
+def find_missing_frame_ranges(total_frames, completed_ranges):
+    """找出未完成的帧范围
+    
+    Args:
+        total_frames: 总帧数
+        completed_ranges: 已完成的帧范围列表 [(start, end, path, mode), ...]
+    
+    Returns:
+        List of tuples: [(start_frame, end_frame), ...]
+    """
+    if not completed_ranges:
+        return [(0, total_frames)]
+    
+    missing = []
+    completed_ranges.sort(key=lambda x: x[0])
+    
+    # 检查开头
+    if completed_ranges[0][0] > 0:
+        missing.append((0, completed_ranges[0][0]))
+    
+    # 检查中间
+    for i in range(len(completed_ranges) - 1):
+        if completed_ranges[i][1] < completed_ranges[i+1][0]:
+            missing.append((completed_ranges[i][1], completed_ranges[i+1][0]))
+    
+    # 检查结尾
+    if completed_ranges[-1][1] < total_frames:
+        missing.append((completed_ranges[-1][1], total_frames))
+    
+    return missing
+
+def merge_all_completed_frames(completed_ranges, output_path, fps, total_frames):
+    """合并所有已完成的帧范围到最终输出，正确处理overlap
+    
+    Args:
+        completed_ranges: 已完成的帧范围列表 [(start, end, path, mode), ...]
+        output_path: 输出视频路径
+        fps: 视频帧率
+        total_frames: 总帧数
+    
+    注意：
+    - segmented模式的segments已经裁剪掉了overlap，可以直接拼接
+    - multi_gpu模式的segments可能包含overlap，需要处理重叠部分
+    """
+    log(f"[Resume] Merging {len(completed_ranges)} completed frame ranges...", "info")
+    
+    # 按start_frame排序
+    completed_ranges.sort(key=lambda x: x[0])
+    
+    merged_parts = []
+    last_end_idx = 0
+    
+    for start, end, path, mode in completed_ranges:
+        log(f"[Resume] Loading frames {start}-{end} from {path} ({mode})", "info")
+        try:
+            segment = torch.load(path, map_location='cpu')
+            
+            # 处理overlap：如果与上一个segment有重叠，跳过重叠部分
+            if last_end_idx > 0 and start < last_end_idx:
+                overlap_frames = last_end_idx - start
+                if overlap_frames < segment.shape[0]:
+                    segment = segment[overlap_frames:]
+                    log(f"[Resume] Skipped {overlap_frames} overlap frames (start={start}, last_end={last_end_idx})", "info")
+                elif overlap_frames >= segment.shape[0]:
+                    log(f"[Resume] Warning: Segment is completely overlapped, skipping", "warning")
+                    del segment
+                    continue
+            
+            # 裁剪到实际需要的帧数
+            actual_frames_needed = end - start
+            if segment.shape[0] > actual_frames_needed:
+                segment = segment[:actual_frames_needed]
+            elif segment.shape[0] < actual_frames_needed:
+                log(f"[Resume] Warning: Segment has {segment.shape[0]} frames, expected {actual_frames_needed}", "warning")
+            
+            merged_parts.append(segment)
+            last_end_idx = end  # 更新最后结束位置
+            del segment
+        except Exception as e:
+            log(f"[Resume] Error loading {path}: {e}", "error")
+            raise
+    
+    # 合并所有部分
+    log(f"[Resume] Concatenating {len(merged_parts)} parts...", "info")
+    if not merged_parts:
+        raise RuntimeError("[Resume] No valid segments to merge")
+    
+    final_output = torch.cat(merged_parts, dim=0)
+    
+    # 裁剪到原始帧数
+    if final_output.shape[0] > total_frames:
+        final_output = final_output[:total_frames]
+    
+    log(f"[Resume] Final output: {final_output.shape[0]} frames", "info")
+    
+    # 保存视频
+    save_video(final_output, output_path, fps=fps)
+    log(f"[Resume] Saved merged video to {output_path}", "finish")
+
 def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, input_fps: float = 30.0):
     """Run inference using multiple GPUs in parallel.
     
@@ -835,13 +1416,87 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
     original_frame_count = frames.shape[0]
     
     # 将视频分割成segments
-    segments = split_video_by_frames(frames, num_gpus, overlap=10)
-    log(f"[Multi-GPU] Split video into {len(segments)} segments", "info")
+    segment_overlap = getattr(args, 'segment_overlap', 2)
+    segments = split_video_by_frames(frames, num_gpus, overlap=segment_overlap)
+    log(f"[Multi-GPU] Split video into {len(segments)} segments (overlap: {segment_overlap} frames)", "info")
     for i, (start, end) in enumerate(segments):
         segment_frames = end - start
         # 估算segment内存占用（假设每帧是1920x1080x3的float32）
         estimated_memory_mb = segment_frames * 1920 * 1080 * 3 * 4 / (1024**2)  # 粗略估算
         log(f"[Multi-GPU] Segment {i}: frames {start}-{end} ({segment_frames} frames, ~{estimated_memory_mb:.1f} MB) -> GPU {devices[i % num_gpus]}", "info")
+    
+    # 检查点续传支持
+    # 使用基于视频名称和放大倍数的目录名
+    video_dir_name = get_video_based_dir_name(args.input, args.scale)
+    checkpoint_dir = None
+    completed_segments = {}
+    
+    # 只有在明确指定 --resume 时才进行断点续传
+    if getattr(args, 'resume', False):
+        if getattr(args, 'clean_checkpoint', False):
+            # 清理检查点
+            checkpoint_dir = os.path.join('/tmp', 'flashvsr_checkpoints', video_dir_name)
+            clean_checkpoint(checkpoint_dir)
+            log(f"[Multi-GPU] Checkpoint cleaned, starting fresh", "info")
+        else:
+            # 使用resume模式，检查已完成的segments
+            checkpoint_dir = os.path.join('/tmp', 'flashvsr_checkpoints', video_dir_name)
+            completed_segments = find_completed_segments(checkpoint_dir, segments)
+            log(f"[Multi-GPU] Resume mode: Found {len(completed_segments)} completed segments out of {len(segments)}", "info")
+            if len(completed_segments) == len(segments):
+                log(f"[Multi-GPU] All segments already completed! Merging results...", "info")
+                # 所有segment都已完成，直接合并结果
+                results = completed_segments
+                # 跳转到合并逻辑
+                use_streaming = getattr(args, 'streaming', False)
+                if use_streaming:
+                    # 流式合并逻辑
+                    output_path = args.output if args.output else args.input.replace('.mp4', '_4x.mp4')
+                    # 需要先加载一个segment获取尺寸
+                    first_segment_path = list(results.values())[0]['path']
+                    first_segment = torch.load(first_segment_path, map_location='cpu')
+                    F, H, W, C = first_segment.shape
+                    streaming_writer = StreamingVideoWriter(output_path, input_fps, height=H, width=W)
+                    del first_segment
+                    sorted_results = sorted(results.items(), key=lambda x: x[1]['start_idx'])
+                    last_end_idx = 0
+                    for worker_id, result_data in sorted_results:
+                        if os.path.exists(result_data['path']):
+                            segment = torch.load(result_data['path'], map_location='cpu')
+                            if last_end_idx > 0 and result_data['start_idx'] < last_end_idx:
+                                overlap_frames = last_end_idx - result_data['start_idx']
+                                if overlap_frames < segment.shape[0]:
+                                    segment = segment[overlap_frames:]
+                            streaming_writer.write_frames(segment)
+                            last_end_idx = result_data['end_idx']
+                            del segment
+                            gc.collect()
+                    streaming_writer.close()
+                    log(f"[Multi-GPU] Streaming merge completed. Output saved to {output_path}", "finish")
+                    return
+    else:
+        # 没有指定 --resume，默认覆盖模式：清理旧的checkpoint和临时文件
+        checkpoint_dir = os.path.join('/tmp', 'flashvsr_checkpoints', video_dir_name)
+        if os.path.exists(checkpoint_dir):
+            clean_checkpoint(checkpoint_dir)
+            log(f"[Multi-GPU] No --resume specified, cleaned old checkpoint. Starting fresh...", "info")
+        
+        # 清理旧的worker输出文件
+        multi_gpu_tmp_dir = os.path.join('/tmp', 'flashvsr_multigpu', video_dir_name)
+        if os.path.exists(multi_gpu_tmp_dir):
+            import shutil
+            try:
+                shutil.rmtree(multi_gpu_tmp_dir)
+                log(f"[Multi-GPU] Cleaned old worker output directory: {multi_gpu_tmp_dir}", "info")
+            except Exception as e:
+                log(f"[Multi-GPU] Warning: Failed to clean old worker output: {e}", "warning")
+        
+        # 创建新的checkpoint目录
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        completed_segments = {}  # 空列表，表示没有已完成的segments
+    
+    # 确定需要处理的segment
+    segments_to_process = [i for i in range(len(segments)) if i not in completed_segments]
     
     # 优化：在主进程中分割frames并保存为临时文件，避免每个worker都读取完整视频
     # 进一步优化：保存后立即释放内存，避免同时保存多个segments
@@ -850,18 +1505,22 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
     import gc
     temp_files = []
     try:
-        log(f"[Multi-GPU] Saving frame segments to temporary files (one at a time to save memory)...", "info")
-        for i, (start_idx, end_idx) in enumerate(segments):
-            log(f"[Multi-GPU] Processing segment {i}...", "info")
-            frames_segment = frames[start_idx:end_idx].cpu().numpy()
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.npy')
-            np.save(temp_file.name, frames_segment)
-            temp_file.close()
-            temp_files.append(temp_file.name)
-            # 立即释放内存
-            del frames_segment
-            gc.collect()
-            log(f"[Multi-GPU] Saved segment {i} ({end_idx-start_idx} frames) to {temp_file.name}", "info")
+        if segments_to_process:
+            log(f"[Multi-GPU] Saving {len(segments_to_process)} frame segments to temporary files (one at a time to save memory)...", "info")
+            for i in segments_to_process:
+                start_idx, end_idx = segments[i]
+                log(f"[Multi-GPU] Processing segment {i}...", "info")
+                frames_segment = frames[start_idx:end_idx].cpu().numpy()
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.npy')
+                np.save(temp_file.name, frames_segment)
+                temp_file.close()
+                temp_files.append((i, temp_file.name))
+                # 立即释放内存
+                del frames_segment
+                gc.collect()
+                log(f"[Multi-GPU] Saved segment {i} ({end_idx-start_idx} frames) to {temp_file.name}", "info")
+        else:
+            log(f"[Multi-GPU] All segments already completed, skipping file saving", "info")
         
         # 释放frames tensor的内存（如果可能）
         # 注意：我们已经保存了 original_frame_count，所以可以安全删除 frames
@@ -878,98 +1537,123 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
         # 准备参数字典
         args_dict = vars(args)
         
-        # 启动worker进程
-        # 优化：错开启动时间，避免同时加载模型导致内存峰值过高
-        # 等待模型加载完成后再启动下一个进程，避免OOM
-        log(f"[Multi-GPU] Launching {num_gpus} worker processes (with model-loading-aware startup)...", "info")
-        model_loaded_flags = {}  # 跟踪每个worker的模型加载状态
+        # 启动worker进程（只处理未完成的segment）
+        if segments_to_process:
+            # 优化：错开启动时间，避免同时加载模型导致内存峰值过高
+            # 等待模型加载完成后再启动下一个进程，避免OOM
+            log(f"[Multi-GPU] Launching {len(segments_to_process)} worker processes (with model-loading-aware startup)...", "info")
+            model_loaded_flags = {}  # 跟踪每个worker的模型加载状态
+            
+            # 创建segment索引到temp_file的映射
+            segment_to_tempfile = {seg_idx: temp_file for seg_idx, temp_file in temp_files}
+            
+            for seg_idx in segments_to_process:
+                start_idx, end_idx = segments[seg_idx]
+                device = devices[seg_idx % num_gpus]
+                temp_file = segment_to_tempfile[seg_idx]
+                
+                # 再次检查GPU内存
+                used, total = get_gpu_memory_info(device)
+                free = total - used
+                log(f"[Multi-GPU] Starting worker {seg_idx} on {device} (available: {free:.2f} GB)", "info")
+                
+                # 检查系统内存
+                sys_used, sys_total = get_system_memory_info()
+                sys_free = sys_total - sys_used
+                log(f"[Multi-GPU] System RAM: {sys_free:.2f} GB free before starting worker {seg_idx}", "info")
+                if sys_free < 8.0:
+                    log(f"[Multi-GPU] WARNING: Low system RAM ({sys_free:.2f} GB). Waiting longer before next worker...", "warning")
+                
+                p = ctx.Process(
+                    target=_worker_process,
+                    args=(seg_idx, device, temp_file, input_fps, args_dict, result_queue, start_idx, end_idx)
+                )
+                p.start()
+                processes.append((seg_idx, p))
+                model_loaded_flags[seg_idx] = False
+                log(f"[Multi-GPU] Worker {seg_idx} process started (PID: {p.pid})", "info")
+        else:
+            log(f"[Multi-GPU] All segments already completed, skipping worker launch", "info")
+            processes = []
         
-        for i, (start_idx, end_idx) in enumerate(segments):
-            device = devices[i % num_gpus]
-            # 再次检查GPU内存
-            used, total = get_gpu_memory_info(device)
-            free = total - used
-            log(f"[Multi-GPU] Starting worker {i} on {device} (available: {free:.2f} GB)", "info")
-            
-            # 检查系统内存
-            sys_used, sys_total = get_system_memory_info()
-            sys_free = sys_total - sys_used
-            log(f"[Multi-GPU] System RAM: {sys_free:.2f} GB free before starting worker {i}", "info")
-            if sys_free < 8.0:
-                log(f"[Multi-GPU] WARNING: Low system RAM ({sys_free:.2f} GB). Waiting longer before next worker...", "warning")
-            
-            p = ctx.Process(
-                target=_worker_process,
-                args=(i, device, temp_files[i], input_fps, args_dict, result_queue, start_idx, end_idx)
-            )
-            p.start()
-            processes.append(p)
-            model_loaded_flags[i] = False
-            log(f"[Multi-GPU] Worker {i} process started (PID: {p.pid})", "info")
-            
-            # 等待模型加载完成后再启动下一个worker（避免OOM）
-            if i < len(segments) - 1:  # 最后一个进程不需要等待
-                log(f"[Multi-GPU] Waiting for worker {i} to finish loading model before starting next worker...", "info")
-                model_loaded = False
-                wait_start = time.time()
-                max_wait_time = 120  # 最多等待2分钟
-                
-                while not model_loaded and (time.time() - wait_start) < max_wait_time:
-                    # 检查进程是否还活着
-                    if not p.is_alive():
-                        exit_code = p.exitcode
-                        if exit_code == -9:
-                            raise RuntimeError(f"Worker {i} was killed (SIGKILL) during model loading - likely OOM!")
-                        elif exit_code is not None and exit_code != 0:
-                            raise RuntimeError(f"Worker {i} exited unexpectedly during model loading (exit code: {exit_code})")
+        # 等待模型加载完成后再启动下一个worker（避免OOM）
+        if segments_to_process and len(segments_to_process) > 1:
+            for idx, (seg_idx, p) in enumerate(processes):
+                if idx < len(processes) - 1:  # 最后一个进程不需要等待
+                    log(f"[Multi-GPU] Waiting for worker {seg_idx} to finish loading model before starting next worker...", "info")
+                    model_loaded = False
+                    wait_start = time.time()
+                    max_wait_time = 120  # 最多等待2分钟
                     
-                    # 检查是否有进度消息
-                    try:
-                        while not result_queue.empty():
-                            result = result_queue.get(timeout=0.1)
-                            if result.get('worker_id') == i:
-                                if result.get('type') == 'progress':
-                                    stage = result.get('stage', '')
-                                    message = result.get('message', '')
-                                    # 检查是否模型加载完成（进入PROCESS阶段表示模型已加载）
-                                    if stage == 'PROCESS' and 'Loading frame segment' in message:
-                                        model_loaded = True
-                                        model_loaded_flags[i] = True
-                                        log(f"[Multi-GPU] Worker {i} model loaded successfully. Starting next worker...", "info")
-                                        break
-                                    elif stage == 'ERROR':
-                                        raise RuntimeError(f"Worker {i} error during model loading: {message}")
-                                elif result.get('type') == 'heartbeat':
-                                    # 心跳消息，继续等待
-                                    pass
-                    except:
-                        pass
+                    while not model_loaded and (time.time() - wait_start) < max_wait_time:
+                        # 检查进程是否还活着
+                        if not p.is_alive():
+                            exit_code = p.exitcode
+                            if exit_code == -9:
+                                raise RuntimeError(f"Worker {seg_idx} was killed (SIGKILL) during model loading - likely OOM!")
+                            elif exit_code is not None and exit_code != 0:
+                                raise RuntimeError(f"Worker {seg_idx} exited unexpectedly during model loading (exit code: {exit_code})")
+                        
+                        # 检查是否有进度消息
+                        try:
+                            while not result_queue.empty():
+                                result = result_queue.get(timeout=0.1)
+                                if result.get('worker_id') == seg_idx:
+                                    if result.get('type') == 'progress':
+                                        stage = result.get('stage', '')
+                                        message = result.get('message', '')
+                                        # 检查是否模型加载完成（进入PROCESS阶段表示模型已加载）
+                                        if stage == 'PROCESS' and 'Loading frame segment' in message:
+                                            model_loaded = True
+                                            model_loaded_flags[seg_idx] = True
+                                            log(f"[Multi-GPU] Worker {seg_idx} model loaded successfully. Starting next worker...", "info")
+                                            break
+                                        elif stage == 'ERROR':
+                                            raise RuntimeError(f"Worker {seg_idx} error during model loading: {message}")
+                                    elif result.get('type') == 'heartbeat':
+                                        # 心跳消息，继续等待
+                                        pass
+                        except:
+                            pass
+                        
+                        # 如果还没加载完成，等待一小段时间
+                        if not model_loaded:
+                            time.sleep(1)
                     
-                    # 如果还没加载完成，等待一小段时间
                     if not model_loaded:
-                        time.sleep(1)
-                
-                if not model_loaded:
-                    elapsed = time.time() - wait_start
-                    log(f"[Multi-GPU] WARNING: Worker {i} model loading timeout after {elapsed:.1f}s. Proceeding anyway...", "warning")
-                    # 继续启动下一个worker，但增加额外延迟
-                    time.sleep(10)  # 额外等待10秒
-                else:
-                    # 模型加载完成后，再等待几秒确保内存稳定
-                    time.sleep(3)
+                        elapsed = time.time() - wait_start
+                        log(f"[Multi-GPU] WARNING: Worker {seg_idx} model loading timeout after {elapsed:.1f}s. Proceeding anyway...", "warning")
+                        # 继续启动下一个worker，但增加额外延迟
+                        time.sleep(10)  # 额外等待10秒
+                    else:
+                        # 模型加载完成后，再等待几秒确保内存稳定
+                        time.sleep(3)
         
         log(f"[Multi-GPU] All workers started. Waiting for results...", "info")
         log(f"[Multi-GPU] Monitoring progress (checking every 2 seconds)...", "info")
         
         # 收集结果（添加进度显示）
         # 流式合并：边处理边输出，减少内存占用
-        use_streaming = getattr(args, 'streaming_merge', True)  # 默认启用流式合并
-        results = {}
-        completed = 0
-        total = num_gpus
+        use_streaming = getattr(args, 'streaming', False)  # 使用streaming参数
+        results = completed_segments.copy()  # 从已完成的segment开始
+        completed = len(completed_segments)
+        total = len(segments)  # 总segment数
         last_progress_time = time.time()
         # 用于检测长期无进展且进程已退出的情况，避免死循环
         last_message_time = time.time()
+        
+        # 跟踪每个worker的进度（用于显示总体进度）
+        worker_progress = {}  # {worker_id: {'tiles_processed': 0, 'total_tiles': 0, 'frames_processed': 0, 'total_frames': 0}}
+        for i, (start, end) in enumerate(segments):
+            worker_progress[i] = {
+                'tiles_processed': 0,
+                'total_tiles': 0,
+                'frames_processed': 0,
+                'total_frames': end - start,
+                'progress_percent': 0.0
+            }
+        last_overall_progress_display = 0.0  # 上次显示的总体进度百分比
+        overall_progress_display_interval = 5.0  # 每5%显示一次总体进度
         
         # 流式写入器（如果启用）
         streaming_writer = None
@@ -988,6 +1672,29 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
                         log(f"[Worker {result['worker_id']}@{result['device']}] {result['stage']}: {result['message']}", "info")
                         last_progress_time = time.time()
                         last_message_time = time.time()
+                    elif result.get('type') == 'tile_progress':
+                        # 处理tile进度消息，更新worker进度并显示总体进度
+                        worker_id = result['worker_id']
+                        if worker_id in worker_progress:
+                            worker_progress[worker_id]['tiles_processed'] = result.get('tiles_processed', 0)
+                            worker_progress[worker_id]['total_tiles'] = result.get('total_tiles', 0)
+                            worker_progress[worker_id]['frames_processed'] = result.get('frames_processed', 0)
+                            worker_progress[worker_id]['progress_percent'] = result.get('progress_percent', 0.0)
+                            
+                            # 计算总体进度
+                            total_frames_processed = sum(wp['frames_processed'] for wp in worker_progress.values())
+                            total_frames_all = sum(wp['total_frames'] for wp in worker_progress.values())
+                            overall_percent = (total_frames_processed / total_frames_all) * 100 if total_frames_all > 0 else 0
+                            
+                            # 只在总体进度变化超过阈值时显示（避免日志过多）
+                            if overall_percent - last_overall_progress_display >= overall_progress_display_interval or overall_percent >= 100.0:
+                                log(f"[Multi-GPU] Overall progress: {total_frames_processed}/{total_frames_all} frames "
+                                    f"({overall_percent:.1f}%) | Worker {worker_id}: {result.get('frames_processed', 0)}/{result.get('total_frames', 0)} frames "
+                                    f"({result.get('progress_percent', 0.0):.1f}%)", "info")
+                                last_overall_progress_display = overall_percent
+                        
+                        last_progress_time = time.time()
+                        last_message_time = time.time()
                     elif result.get('type') == 'heartbeat':
                         # 心跳消息，不显示但更新时间戳
                         last_progress_time = time.time()
@@ -996,12 +1703,37 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
                         # 这是最终结果
                         completed += 1
                         if result.get('success', False):
-                            results[result['worker_id']] = {
+                            worker_id = result['worker_id']
+                            results[worker_id] = {
                                 'start_idx': result['start_idx'],
                                 'end_idx': result['end_idx'],
                                 'path': result['path']
                             }
-                            log(f"[Multi-GPU] Worker {result['worker_id']} completed ({completed}/{total})", "finish")
+                            
+                            # 更新worker进度为100%
+                            if worker_id in worker_progress:
+                                worker_progress[worker_id]['frames_processed'] = worker_progress[worker_id]['total_frames']
+                                worker_progress[worker_id]['progress_percent'] = 100.0
+                            
+                            # 计算并显示最终总体进度
+                            total_frames_processed = sum(wp['frames_processed'] for wp in worker_progress.values())
+                            total_frames_all = sum(wp['total_frames'] for wp in worker_progress.values())
+                            overall_percent = (total_frames_processed / total_frames_all) * 100 if total_frames_all > 0 else 0
+                            
+                            log(f"[Multi-GPU] Worker {worker_id} completed ({completed}/{total}) | "
+                                f"Overall progress: {total_frames_processed}/{total_frames_all} frames ({overall_percent:.1f}%)", "finish")
+                            
+                            # 更新检查点（每个segment完成时立即保存）
+                            if checkpoint_dir:
+                                checkpoint_data = load_checkpoint(checkpoint_dir) or {}
+                                start_idx, end_idx = segments[worker_id]
+                                segment_key = f"segment_{worker_id}_{start_idx}_{end_idx}"
+                                checkpoint_data[segment_key] = {
+                                    'start_idx': result['start_idx'],
+                                    'end_idx': result['end_idx'],
+                                    'path': result['path']
+                                }
+                                save_checkpoint(checkpoint_dir, checkpoint_data)
                             
                             # 流式合并：如果启用，按顺序写入segments
                             if use_streaming:
@@ -1038,13 +1770,13 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
                     elapsed = time.time() - last_progress_time
                     
                     # 检查进程状态（更频繁地检查，以便及时发现问题）
-                    alive_count = sum(1 for p in processes if p.is_alive())
-                    exit_codes = [p.exitcode for p in processes]
+                    alive_count = sum(1 for _, p in processes if p.is_alive())
+                    exit_codes = {seg_idx: p.exitcode for seg_idx, p in processes}
                     
                     # 检查是否有进程被杀死（-9 表示 SIGKILL，通常是 OOM）
-                    killed_processes = [i for i, p in enumerate(processes) if p.exitcode == -9]
+                    killed_processes = [seg_idx for seg_idx, p in processes if p.exitcode == -9]
                     if killed_processes:
-                        killed_devices = [devices[i % num_gpus] for i in killed_processes]
+                        killed_devices = [devices[seg_idx % num_gpus] for seg_idx in killed_processes]
                         error_msg = f"Worker process(es) {killed_processes} were killed (SIGKILL, exit code -9). "
                         error_msg += f"This usually indicates Out-Of-Memory (OOM). Devices: {killed_devices}. "
                         error_msg += f"Exit codes: {exit_codes}\n"
@@ -1097,16 +1829,16 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
                     if alive_count < len(processes) and completed < total:
                         # 只检查异常退出的进程（退出码非0且非None）
                         # 退出码为0表示正常完成，消息会在队列中被正常处理
-                        dead_processes = [i for i, p in enumerate(processes) 
+                        dead_processes = [seg_idx for seg_idx, p in processes 
                                         if not p.is_alive() and p.exitcode is not None and p.exitcode != 0]
                         if dead_processes:
                             error_msg = f"Worker process(es) {dead_processes} exited unexpectedly. Exit codes: {exit_codes}"
                             log(error_msg, "error")
-                            for i in dead_processes:
-                                if exit_codes[i] == -9:
-                                    log(f"Process {i} was killed (SIGKILL) - likely OOM", "error")
+                            for seg_idx in dead_processes:
+                                if exit_codes.get(seg_idx) == -9:
+                                    log(f"Process {seg_idx} was killed (SIGKILL) - likely OOM", "error")
                                 else:
-                                    log(f"Process {i} exited with code {exit_codes[i]}", "error")
+                                    log(f"Process {seg_idx} exited with code {exit_codes.get(seg_idx)}", "error")
                             raise RuntimeError(error_msg)
                         
                         # 对于正常退出（退出码0）的进程，不报告错误
@@ -1114,7 +1846,7 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
                     
                     # 检查进程是否卡住：进程还在运行但没有消息超过60秒
                     if alive_count > 0 and (time.time() - last_message_time) > 60:
-                        stuck_processes = [i for i, p in enumerate(processes) if p.is_alive()]
+                        stuck_processes = [seg_idx for seg_idx, p in processes if p.is_alive()]
                         if stuck_processes:
                             error_msg = f"Worker process(es) {stuck_processes} appear to be stuck (no messages for 60s). "
                             error_msg += f"Processes are alive but not responding. Exit codes: {exit_codes}"
@@ -1137,19 +1869,19 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
                             if -9 in exit_codes:
                                 log("检测到进程被 SIGKILL 杀死，可能是内存不足 (OOM)", "error")
                             # 尝试获取最后的错误信息
-                            for i, p in enumerate(processes):
+                            for seg_idx, p in processes:
                                 if p.exitcode != 0:
                                     if p.exitcode == -9:
-                                        log(f"Process {i} was killed (SIGKILL) - likely OOM", "error")
+                                        log(f"Process {seg_idx} was killed (SIGKILL) - likely OOM", "error")
                                     else:
-                                        log(f"Process {i} exited with code {p.exitcode}", "error")
+                                        log(f"Process {seg_idx} exited with code {p.exitcode}", "error")
                             raise RuntimeError(error_msg)
                         
                         # 如果长时间无任何消息且进程数量减少，也视为异常
                         if (time.time() - last_message_time) > 120 and completed < total:
                             error_msg = f"No progress messages for 120s; possible worker hang/crash. Exit codes: {exit_codes}"
                             log(error_msg, "error")
-                            if -9 in exit_codes:
+                            if -9 in exit_codes.values():
                                 log("检测到进程被 SIGKILL 杀死，可能是内存不足 (OOM)", "error")
                             raise RuntimeError(error_msg)
                     time.sleep(0.5)
@@ -1164,12 +1896,22 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
         
         # 等待所有进程完成
         log(f"[Multi-GPU] All workers finished. Waiting for processes to exit...", "info")
-        for i, p in enumerate(processes):
+        for seg_idx, p in processes:
             p.join(timeout=30)
             if p.exitcode != 0:
-                log(f"[Multi-GPU] Process {i} exited with code {p.exitcode}", "error")
+                log(f"[Multi-GPU] Process {seg_idx} exited with code {p.exitcode}", "error")
             else:
-                log(f"[Multi-GPU] Process {i} exited successfully", "info")
+                log(f"[Multi-GPU] Process {seg_idx} exited successfully", "info")
+        
+        # 更新检查点（保存所有完成的结果）
+        if checkpoint_dir and results:
+            checkpoint_data = load_checkpoint(checkpoint_dir) or {}
+            for worker_id, result_data in results.items():
+                start_idx, end_idx = segments[worker_id]
+                segment_key = f"segment_{worker_id}_{start_idx}_{end_idx}"
+                checkpoint_data[segment_key] = result_data
+            save_checkpoint(checkpoint_dir, checkpoint_data)
+            log(f"[Multi-GPU] Checkpoint updated: {len(results)} segments saved", "info")
         
         # 合并segments（流式或传统方式）
         if use_streaming and streaming_writer is not None:
@@ -1232,41 +1974,70 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
             # 流式模式下，返回None（视频已保存到文件）
             return None
         else:
-            # 传统合并方式：等待所有完成后再合并
-            log(f"[Multi-GPU] Merging {len(results)} segments...", "info")
-            segment_list = []
-            for i in sorted(results.keys()):
-                path = results[i]['path']
-                out = torch.load(path, map_location='cpu')
-                segment_list.append((results[i]['start_idx'], results[i]['end_idx'], out))
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
-
-            merged_output = merge_video_segments(segment_list, original_frame_count)
-            process_time = time.time() - process_start
-            log(f"[Multi-GPU] Successfully processed and merged {num_gpus} segments", "finish")
-            log(f"[Multi-GPU] Processing time: {format_duration(process_time)}", "finish")
-            return merged_output
+            # 流式合并方式：逐个加载和处理segments，避免OOM
+            log(f"[Multi-GPU] Streaming merge: merging {len(results)} segments (avoiding OOM)...", "info")
+            loaded_files = []  # 跟踪已加载的文件，只有在合并成功后才删除
+            
+            try:
+                # 构建segments信息列表（start_idx, end_idx, path）
+                segments_info = []
+                for i in sorted(results.keys()):
+                    path = results[i]['path']
+                    if not os.path.exists(path):
+                        raise FileNotFoundError(f"Segment file not found: {path}")
+                    segments_info.append((results[i]['start_idx'], results[i]['end_idx'], path))
+                    loaded_files.append(path)
+                
+                # 使用流式合并函数
+                log(f"[Multi-GPU] Starting streaming merge of {len(segments_info)} segments...", "info")
+                merged_output = merge_video_segments_streaming(segments_info, original_frame_count)
+                log(f"[Multi-GPU] Merged output shape: {merged_output.shape}", "info")
+                
+                # 注意：不在这里删除worker文件，让main函数在保存视频成功后再删除
+                # 这样可以确保在视频成功保存之前，临时文件不会被删除
+                log(f"[Multi-GPU] Worker files preserved (will be cleaned after video is saved):", "info")
+                for path in loaded_files:
+                    if os.path.exists(path):
+                        log(f"[Multi-GPU]   - {path}", "info")
+                
+                process_time = time.time() - process_start
+                log(f"[Multi-GPU] Successfully processed and merged {num_gpus} segments", "finish")
+                log(f"[Multi-GPU] Processing time: {format_duration(process_time)}", "finish")
+                return merged_output
+                
+            except Exception as merge_error:
+                log(f"[Multi-GPU] ERROR: Failed to merge segments: {merge_error}", "error")
+                import traceback
+                log(f"[Multi-GPU] Traceback: {traceback.format_exc()}", "error")
+                # 保留文件以便手动恢复
+                log(f"[Multi-GPU] Segment files preserved for manual recovery:", "warning")
+                for path in loaded_files:
+                    if os.path.exists(path):
+                        log(f"[Multi-GPU]   - {path}", "warning")
+                # 也保留未加载的文件
+                for i in sorted(results.keys()):
+                    path = results[i]['path']
+                    if path not in loaded_files and os.path.exists(path):
+                        log(f"[Multi-GPU]   - {path}", "warning")
+                raise
     
     finally:
         # 确保所有进程都被正确终止和清理
-        for i, p in enumerate(processes):
+        for seg_idx, p in processes:
             try:
                 if p.is_alive():
-                    log(f"[Multi-GPU] Terminating process {i} (PID: {p.pid})", "warning")
+                    log(f"[Multi-GPU] Terminating process {seg_idx} (PID: {p.pid})", "warning")
                     try:
                         p.terminate()
                         p.join(timeout=5)
                         if p.is_alive():
-                            log(f"[Multi-GPU] Force killing process {i} (PID: {p.pid})", "warning")
+                            log(f"[Multi-GPU] Force killing process {seg_idx} (PID: {p.pid})", "warning")
                             p.kill()
                             p.join(timeout=2)
                             if p.is_alive():
-                                log(f"[Multi-GPU] Process {i} still alive after kill, may need manual cleanup", "error")
+                                log(f"[Multi-GPU] Process {seg_idx} still alive after kill, may need manual cleanup", "error")
                     except Exception as e:
-                        log(f"[Multi-GPU] Error terminating process {i}: {e}", "warning")
+                        log(f"[Multi-GPU] Error terminating process {seg_idx}: {e}", "warning")
                 else:
                     # 即使进程已退出，也确保 join 完成
                     try:
@@ -1274,25 +2045,31 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
                     except:
                         pass
             except Exception as e:
-                log(f"[Multi-GPU] Error cleaning up process {i}: {e}", "warning")
+                log(f"[Multi-GPU] Error cleaning up process {seg_idx}: {e}", "warning")
         
         # 清理临时文件
-        for temp_file in temp_files:
+        for seg_idx, temp_file_path in temp_files:
             try:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-                    log(f"[Multi-GPU] Cleaned up temporary file: {temp_file}", "info")
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+                    log(f"[Multi-GPU] Cleaned up temporary file: {temp_file_path}", "info")
             except Exception as e:
-                log(f"[Multi-GPU] Failed to remove temporary file {temp_file}: {e}", "warning")
+                log(f"[Multi-GPU] Failed to remove temporary file {temp_file_path}: {e}", "warning")
         
         # 清理队列：清空队列并关闭
         try:
+            # 先等待所有进程完全退出，确保没有进程在使用队列
+            time.sleep(0.5)  # 短暂等待，确保所有进程都已完成
+            
             # 清空队列中剩余的所有项目（使用非阻塞方式）
             items_cleared = 0
-            while True:
+            max_clear_attempts = 100  # 限制清空尝试次数，避免无限循环
+            clear_attempts = 0
+            while clear_attempts < max_clear_attempts:
                 try:
                     result_queue.get_nowait()
                     items_cleared += 1
+                    clear_attempts += 1
                 except:
                     break
             if items_cleared > 0:
@@ -1300,19 +2077,35 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
             
             # 关闭队列以释放资源
             result_queue.close()
+            
             # 等待队列的后台线程完成
-            # 注意：join_thread() 不接受 timeout 参数，会一直等待直到完成
-            try:
-                result_queue.join_thread()
-            except Exception as join_error:
-                # 如果 join_thread 失败，记录但不阻止清理
-                log(f"[Multi-GPU] Queue join_thread warning: {join_error}", "warning")
+            # 使用超时机制避免无限等待
+            import threading
+            join_completed = threading.Event()
+            
+            def join_with_timeout():
+                try:
+                    result_queue.join_thread()
+                    join_completed.set()
+                except Exception as e:
+                    log(f"[Multi-GPU] Queue join_thread error: {e}", "warning")
+                    join_completed.set()
+            
+            join_thread = threading.Thread(target=join_with_timeout, daemon=True)
+            join_thread.start()
+            join_thread.join(timeout=5.0)  # 最多等待5秒
+            
+            if not join_completed.is_set():
+                log(f"[Multi-GPU] Queue join_thread timeout, continuing cleanup", "warning")
         except Exception as e:
             log(f"[Multi-GPU] Error cleaning up queue: {e}", "warning")
         finally:
             # 确保队列对象被删除
             try:
                 del result_queue
+                # 强制垃圾回收，确保资源被释放
+                import gc
+                gc.collect()
             except:
                 pass
 
@@ -1578,6 +2371,14 @@ def _worker_process(worker_id: int, device: str, segment_file: str,
         # 执行推理
         report_progress("PROCESS", f"Starting inference on {frames_segment.shape[0]} frames...")
         
+        # 标记这是worker进程，用于进度报告
+        args._is_worker = True
+        args._worker_id = worker_id
+        args._result_queue = result_queue
+        args._total_frames = frames_segment.shape[0]
+        args._start_idx = start_idx
+        args._end_idx = end_idx
+        
         # 确保run_inference函数可用（在spawn模式下可能需要重新导入）
         try:
             # 尝试直接使用
@@ -1611,7 +2412,16 @@ def _worker_process(worker_id: int, device: str, segment_file: str,
             raise RuntimeError(error_msg) from inference_error
 
         # 保存到临时文件，返回路径
-        tmp_dir = os.path.join('/tmp', 'flashvsr_multigpu')
+        # 使用基于视频名称和放大倍数的目录名
+        # 注意：在worker进程中，input路径应该从args_dict传递过来
+        input_path = getattr(args, 'input', None)
+        if input_path and input_path != 'unknown' and os.path.exists(input_path):
+            video_dir_name = get_video_based_dir_name(input_path, args.scale)
+        else:
+            # 如果无法获取input路径，使用worker信息作为fallback
+            # 这种情况下，主进程会使用正确的目录名
+            video_dir_name = f"worker_{start_idx}_{end_idx}_{args.scale}x"
+        tmp_dir = os.path.join('/tmp', 'flashvsr_multigpu', video_dir_name)
         os.makedirs(tmp_dir, exist_ok=True)
         out_path = os.path.join(tmp_dir, f"worker_{worker_id}_{uuid.uuid4().hex}.pt")
         torch.save(output, out_path)
@@ -1625,6 +2435,20 @@ def _worker_process(worker_id: int, device: str, segment_file: str,
         })
 
         report_progress("DONE", f"Results saved to {out_path}")
+        
+        # 清理worker标记
+        if hasattr(args, '_is_worker'):
+            delattr(args, '_is_worker')
+        if hasattr(args, '_worker_id'):
+            delattr(args, '_worker_id')
+        if hasattr(args, '_result_queue'):
+            delattr(args, '_result_queue')
+        if hasattr(args, '_total_frames'):
+            delattr(args, '_total_frames')
+        if hasattr(args, '_start_idx'):
+            delattr(args, '_start_idx')
+        if hasattr(args, '_end_idx'):
+            delattr(args, '_end_idx')
 
         del pipe, output, frames_segment
         clean_vram()
@@ -1827,6 +2651,406 @@ def process_tile_batch(pipe, frames, device, dtype, args, tile_batch: List[Tuple
     
     return results
 
+def run_inference_segmented(pipe, frames, device, dtype, args, max_segment_frames=None):
+    """分段处理视频：将视频分成多个sub-segments，每个独立处理并保存，最后拼接。
+    
+    这是streaming模式的替代方案，更简单、更可靠。
+    只在用户明确启用 --segmented 时使用。
+    
+    支持在 multi_gpu worker 模式下使用，此时会记录相对于原始视频的绝对帧范围。
+    
+    Args:
+        max_segment_frames: 每个sub-segment的最大帧数（None表示自动计算）
+    
+    Returns:
+        处理后的视频tensor (F, H, W, C)
+    """
+    N, H, W, C = frames.shape
+    N_original = N
+    
+    # 检查是否在 multi_gpu worker 模式下（需要记录绝对帧范围）
+    is_worker_mode = hasattr(args, '_is_worker') and args._is_worker
+    worker_start_idx = getattr(args, '_start_idx', 0)  # worker 接收的 segment 在原始视频中的起始帧
+    worker_end_idx = getattr(args, '_end_idx', N)  # worker 接收的 segment 在原始视频中的结束帧
+    
+    # 自动计算合适的segment大小（基于可用内存）
+    # 优先使用用户指定的值
+    if max_segment_frames is None:
+        max_segment_frames = getattr(args, 'max_segment_frames', None)
+    
+    if max_segment_frames is None:
+        try:
+            sys_used, sys_total = get_system_memory_info()
+            sys_free = sys_total - sys_used
+            
+            # 计算每个segment的canvas内存需求
+            # 使用可用内存的40%作为每个segment的canvas（更激进，减少segment数量）
+            segment_canvas_memory_gb = sys_free * 0.40
+            segment_canvas_memory_gb = max(10.0, min(segment_canvas_memory_gb, 60.0))  # 10-60GB（提高上限）
+            
+            log(f"[Segmented] Available memory: {sys_free:.2f} GB, using {segment_canvas_memory_gb:.2f} GB per segment", "info")
+            
+            # 计算可以处理的帧数
+            max_segment_frames = int((segment_canvas_memory_gb * (1024**3)) / 
+                                    (H * args.scale * W * args.scale * C * 2 * 2))  # 2个canvas
+            max_segment_frames = max(21, max_segment_frames)  # 至少21帧
+            max_segment_frames = largest_8n1_leq(max_segment_frames)  # 对齐到8n+1
+            max_segment_frames = min(max_segment_frames, 1000)  # 最多1000帧（提高上限）
+            
+            log(f"[Segmented] Calculated max_segment_frames: {max_segment_frames} frames", "info")
+        except Exception as e:
+            log(f"[Segmented] Failed to calculate segment size: {e}, using default", "warning")
+            max_segment_frames = 200  # 提高默认值（从100到200）
+    
+    # 计算需要多少个sub-segments
+    num_segments = (N + max_segment_frames - 1) // max_segment_frames
+    segment_overlap = getattr(args, 'segment_overlap', 2)
+    
+    log(f"[Segmented] Processing video in {num_segments} sub-segments "
+        f"(max {max_segment_frames} frames per segment, overlap: {segment_overlap} frames)", "info")
+    
+    # 创建基于视频名称和放大倍数的临时目录名，支持断点续跑
+    # 如果在worker模式下，必须使用worker信息作为标识，避免不同worker使用同一个目录
+    if is_worker_mode:
+        # worker模式下，始终使用worker信息作为标识，确保每个worker有独立的目录
+        video_dir_name = f"worker_{worker_start_idx}_{worker_end_idx}_{args.scale}x"
+    else:
+        # 非worker模式：使用基于视频名称的目录名
+        input_path = getattr(args, 'input', None)
+        if input_path and input_path != 'unknown' and os.path.exists(input_path):
+            video_dir_name = get_video_based_dir_name(input_path, args.scale)
+        else:
+            # 如果无法获取有效的input路径，使用hash作为fallback
+            import hashlib
+            segment_key_data = {
+                'input': os.path.abspath(getattr(args, 'input', 'unknown')),
+                'scale': args.scale,
+                'mode': args.mode,
+                'tile_size': args.tile_size,
+                'tile_overlap': args.tile_overlap,
+                'tiled_dit': args.tiled_dit,
+                'tiled_vae': args.tiled_vae,
+                'max_segment_frames': max_segment_frames,
+                'num_segments': num_segments,
+                'N_original': N_original
+            }
+            segment_id = hashlib.md5(json.dumps(segment_key_data, sort_keys=True).encode()).hexdigest()
+            video_dir_name = segment_id
+    
+    tmp_dir = os.path.join('/tmp', 'flashvsr_segments', video_dir_name)
+    os.makedirs(tmp_dir, exist_ok=True)
+    log(f"[Segmented] Using directory: {tmp_dir}", "info")
+    
+    # 检查是否已有已完成的segment文件（断点续跑）
+    segment_files = []
+    completed_segments = 0
+    for seg_idx in range(num_segments):
+        start_frame = seg_idx * max_segment_frames
+        end_frame = min((seg_idx + 1) * max_segment_frames, N)
+        segment_file = os.path.join(tmp_dir, f"segment_{seg_idx:04d}.pt")
+        metadata_file = os.path.join(tmp_dir, f"segment_{seg_idx:04d}.json")
+        
+        if os.path.exists(segment_file):
+            try:
+                # 验证文件是否完整（检查文件大小）
+                file_size = os.path.getsize(segment_file)
+                if file_size > 0:
+                    # 如果有metadata文件，从中读取准确的帧范围（优先使用绝对帧范围）
+                    if os.path.exists(metadata_file):
+                        try:
+                            with open(metadata_file, 'r') as f:
+                                metadata = json.load(f)
+                            # 优先使用绝对帧范围（如果存在）
+                            start_frame = metadata.get('start_frame', metadata.get('relative_start_frame', start_frame))
+                            end_frame = metadata.get('end_frame', metadata.get('relative_end_frame', end_frame))
+                        except:
+                            pass
+                    
+                    segment_files.append((seg_idx, segment_file, start_frame, end_frame))
+                    completed_segments += 1
+                    log(f"[Segmented] Found existing segment {seg_idx + 1}/{num_segments} (frames {start_frame}-{end_frame}) at {segment_file}", "info")
+            except:
+                pass
+    
+    # 检查是否应该进行断点续传（只有在明确指定--resume时才续传）
+    should_resume = getattr(args, 'resume', False)
+    
+    if completed_segments == num_segments and should_resume:
+        log(f"[Segmented] All {num_segments} segments already completed! Merging results...", "info")
+        # 所有segment都已完成，直接合并结果
+    elif completed_segments == num_segments and not should_resume:
+        # 没有指定--resume，但找到了已完成的segments，清理并重新开始
+        log(f"[Segmented] Found {num_segments} completed segments but --resume not specified. Cleaning and starting fresh...", "info")
+        import shutil
+        try:
+            shutil.rmtree(tmp_dir)
+            os.makedirs(tmp_dir, exist_ok=True)
+            log(f"[Segmented] Cleaned old segments directory: {tmp_dir}", "info")
+        except Exception as e:
+            log(f"[Segmented] Warning: Failed to clean old segments: {e}", "warning")
+        completed_segments = 0
+        segment_files = []
+    elif completed_segments > 0 and should_resume:
+        log(f"[Segmented] Resume mode: Found {completed_segments}/{num_segments} completed segments, processing remaining segments...", "info")
+    elif completed_segments > 0 and not should_resume:
+        # 没有指定--resume，但找到了部分已完成的segments，清理并重新开始
+        log(f"[Segmented] Found {completed_segments}/{num_segments} completed segments but --resume not specified. Cleaning and starting fresh...", "info")
+        import shutil
+        try:
+            shutil.rmtree(tmp_dir)
+            os.makedirs(tmp_dir, exist_ok=True)
+            log(f"[Segmented] Cleaned old segments directory: {tmp_dir}", "info")
+        except Exception as e:
+            log(f"[Segmented] Warning: Failed to clean old segments: {e}", "warning")
+        completed_segments = 0
+        segment_files = []
+    else:
+        log(f"[Segmented] Starting fresh processing of all segments...", "info")
+    
+    try:
+        # 处理每个未完成的sub-segment
+        for seg_idx in range(num_segments):
+            # 检查是否已存在
+            start_frame = seg_idx * max_segment_frames
+            end_frame = min((seg_idx + 1) * max_segment_frames, N)
+            segment_file = os.path.join(tmp_dir, f"segment_{seg_idx:04d}.pt")
+            
+            # 如果segment已存在且完整，跳过处理
+            metadata_file = os.path.join(tmp_dir, f"segment_{seg_idx:04d}.json")
+            if os.path.exists(segment_file):
+                try:
+                    file_size = os.path.getsize(segment_file)
+                    if file_size > 0:
+                        # 如果有metadata文件，从中读取准确的帧范围（优先使用绝对帧范围）
+                        if os.path.exists(metadata_file):
+                            try:
+                                with open(metadata_file, 'r') as f:
+                                    metadata = json.load(f)
+                                # 优先使用绝对帧范围（如果存在）
+                                start_frame = metadata.get('start_frame', metadata.get('relative_start_frame', start_frame))
+                                end_frame = metadata.get('end_frame', metadata.get('relative_end_frame', end_frame))
+                            except:
+                                pass
+                        
+                        # 确保在segment_files中（可能之前已添加）
+                        found = False
+                        for existing in segment_files:
+                            if existing[0] == seg_idx:
+                                found = True
+                                break
+                        if not found:
+                            segment_files.append((seg_idx, segment_file, start_frame, end_frame))
+                        log(f"[Segmented] Skipping sub-segment {seg_idx + 1}/{num_segments} (frames {start_frame}-{end_frame}, already completed)", "info")
+                        continue
+                except:
+                    pass
+            
+            # 提取segment（包含重叠）
+            seg_start = max(0, start_frame - segment_overlap if seg_idx > 0 else 0)
+            seg_end = min(N, end_frame + segment_overlap if seg_idx < num_segments - 1 else N)
+            
+            log(f"[Segmented] Processing sub-segment {seg_idx + 1}/{num_segments}: "
+                f"frames {seg_start}-{seg_end} (output: {start_frame}-{end_frame})", "info")
+            
+            # 提取segment frames
+            segment_frames = frames[seg_start:seg_end]
+            
+            # 确保至少有21帧
+            if segment_frames.shape[0] < 21:
+                add = 21 - segment_frames.shape[0]
+                last_frame = segment_frames[-1:, :, :, :]
+                padding_frames = last_frame.repeat(add, 1, 1, 1)
+                segment_frames = torch.cat([segment_frames, padding_frames], dim=0)
+            
+            # 处理这个segment（递归调用run_inference，但禁用segmented避免无限递归）
+            # 临时禁用segmented标志
+            original_segmented = getattr(args, 'segmented', False)
+            args.segmented = False
+            try:
+                segment_output = run_inference(pipe, segment_frames, device, dtype, args, streaming_writer=None)
+            finally:
+                args.segmented = original_segmented
+            
+            # 裁剪重叠部分
+            if seg_idx > 0:
+                segment_output = segment_output[segment_overlap:]
+            if seg_idx < num_segments - 1:
+                segment_output = segment_output[:-segment_overlap]
+            
+            # 裁剪或填充到实际需要的帧数
+            actual_frames = end_frame - start_frame
+            if segment_output.shape[0] > actual_frames:
+                segment_output = segment_output[:actual_frames]
+            elif segment_output.shape[0] < actual_frames:
+                # 如果输出帧数不足，用最后一帧填充
+                missing_frames = actual_frames - segment_output.shape[0]
+                last_frame = segment_output[-1:, :, :, :]
+                padding_frames = last_frame.repeat(missing_frames, 1, 1, 1)
+                segment_output = torch.cat([segment_output, padding_frames], dim=0)
+                log(f"[Segmented] Padded {missing_frames} frames to match expected {actual_frames} frames", "warning")
+            
+            # 保存到临时文件
+            segment_file = os.path.join(tmp_dir, f"segment_{seg_idx:04d}.pt")
+            torch.save(segment_output, segment_file)
+            
+            # 保存元数据文件，记录帧范围信息（用于统一checkpoint系统）
+            metadata_file = os.path.join(tmp_dir, f"segment_{seg_idx:04d}.json")
+            
+            # 如果在 multi_gpu worker 模式下，需要转换为相对于原始视频的绝对帧范围
+            if is_worker_mode:
+                # start_frame 和 end_frame 是相对于 worker 接收的 frames 的
+                # 需要转换为相对于原始视频的绝对帧范围
+                absolute_start_frame = worker_start_idx + start_frame
+                absolute_end_frame = worker_start_idx + end_frame
+            else:
+                absolute_start_frame = start_frame
+                absolute_end_frame = end_frame
+            
+            metadata = {
+                'seg_idx': seg_idx,
+                'start_frame': absolute_start_frame,  # 相对于原始视频的绝对帧范围
+                'end_frame': absolute_end_frame,
+                'relative_start_frame': start_frame,  # 相对于当前 frames 的相对帧范围（向后兼容）
+                'relative_end_frame': end_frame,
+                'actual_frames': segment_output.shape[0],
+                'segment_file': segment_file,
+                'is_worker_mode': is_worker_mode,
+                'worker_start_idx': worker_start_idx if is_worker_mode else None,
+                'worker_end_idx': worker_end_idx if is_worker_mode else None
+            }
+            try:
+                with open(metadata_file, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+            except:
+                pass
+            
+            # 使用绝对帧范围（用于统一checkpoint系统）
+            segment_files.append((seg_idx, segment_file, absolute_start_frame, absolute_end_frame))
+            
+            log(f"[Segmented] Saved sub-segment {seg_idx + 1}/{num_segments} "
+                f"({segment_output.shape[0]} frames, absolute frames {absolute_start_frame}-{absolute_end_frame}) to {segment_file}", "info")
+            
+            # 释放内存
+            del segment_output, segment_frames
+            clean_vram()
+        
+        # 按顺序加载并拼接所有segments（确保按seg_idx排序）
+        segment_files.sort(key=lambda x: x[0])  # 按seg_idx排序
+        log(f"[Segmented] Merging {len(segment_files)} sub-segments...", "info")
+        
+        try:
+            # 流式合并：逐个加载和合并，避免同时保存多个大tensor在内存中
+            final_output = None
+            last_end_frame = None
+            
+            for seg_idx, segment_file, start_frame, end_frame in segment_files:
+                if not os.path.exists(segment_file):
+                    raise FileNotFoundError(f"Segment file not found: {segment_file}")
+                
+                log(f"[Segmented] Loading segment {seg_idx + 1}/{len(segment_files)}: {os.path.basename(segment_file)}", "info")
+                segment = torch.load(segment_file, map_location='cpu')
+                
+                # 处理overlap（如果存在）
+                if last_end_frame is not None and start_frame < last_end_frame:
+                    overlap_frames = last_end_frame - start_frame
+                    if overlap_frames < segment.shape[0]:
+                        segment = segment[overlap_frames:]
+                        log(f"[Segmented] Skipped {overlap_frames} overlap frames", "info")
+                    elif overlap_frames >= segment.shape[0]:
+                        log(f"[Segmented] Warning: Segment {seg_idx} is completely overlapped, skipping", "warning")
+                        del segment
+                        gc.collect()
+                        continue
+                
+                # 合并到final_output（使用临时文件避免内存峰值）
+                if final_output is None:
+                    final_output = segment
+                else:
+                    # 对于大文件，使用临时文件来避免内存峰值
+                    # 先检查内存使用情况
+                    import psutil
+                    process = psutil.Process()
+                    mem_info = process.memory_info()
+                    mem_gb = mem_info.rss / (1024**3)
+                    
+                    # 如果内存使用超过150GB，使用临时文件合并
+                    if mem_gb > 150 or (final_output.numel() * final_output.element_size() / (1024**3)) > 50:
+                        log(f"[Segmented] High memory usage ({mem_gb:.1f} GB), using temporary file for merging...", "info")
+                        # 保存当前final_output到临时文件
+                        temp_merged_file = os.path.join(tmp_dir, f"_temp_merged_{seg_idx}.pt")
+                        torch.save(final_output, temp_merged_file)
+                        del final_output
+                        gc.collect()
+                        
+                        # 加载两个文件并合并
+                        final_output = torch.load(temp_merged_file, map_location='cpu')
+                        final_output = torch.cat([final_output, segment], dim=0)
+                        del segment
+                        gc.collect()
+                        
+                        # 保存合并结果
+                        torch.save(final_output, temp_merged_file)
+                        del final_output
+                        gc.collect()
+                        
+                        # 重新加载
+                        final_output = torch.load(temp_merged_file, map_location='cpu')
+                        
+                        # 删除旧的临时文件
+                        if seg_idx > 0:
+                            old_temp_file = os.path.join(tmp_dir, f"_temp_merged_{seg_idx-1}.pt")
+                            if os.path.exists(old_temp_file):
+                                try:
+                                    os.remove(old_temp_file)
+                                except:
+                                    pass
+                    else:
+                        # 内存充足，直接合并
+                        log(f"[Segmented] Merging segment {seg_idx + 1}...", "info")
+                        final_output = torch.cat([final_output, segment], dim=0)
+                        # 立即释放segment内存
+                        del segment
+                        gc.collect()
+                
+                last_end_frame = end_frame
+            
+            if final_output is None:
+                raise RuntimeError("[Segmented] No valid segments to merge")
+            
+            # 裁剪到原始帧数
+            if final_output.shape[0] > N_original:
+                final_output = final_output[:N_original]
+            
+            log(f"[Segmented] Merged {len(segment_files)} sub-segments into final output "
+                f"({final_output.shape[0]} frames)", "info")
+            
+            # 注意：不在这里删除临时文件，让main函数在保存视频成功后再删除
+            # 这样可以确保在视频成功保存之前，临时文件不会被删除
+            log(f"[Segmented] Temporary files preserved in: {tmp_dir} (will be cleaned after video is saved)", "info")
+            
+            return final_output
+            
+        except Exception as merge_error:
+            # 合并失败，保留临时文件以便恢复
+            log(f"[Segmented] ERROR: Failed to merge segments: {merge_error}", "error")
+            log(f"[Segmented] Temporary files preserved in: {tmp_dir}", "warning")
+            log(f"[Segmented] You can recover the result by manually merging files:", "warning")
+            for seg_idx, segment_file, start_frame, end_frame in segment_files:
+                if os.path.exists(segment_file):
+                    log(f"[Segmented]   - {segment_file} (frames {start_frame}-{end_frame})", "warning")
+            raise RuntimeError(f"Failed to merge segments: {merge_error}. Temporary files preserved in {tmp_dir}") from merge_error
+        
+    except Exception as outer_error:
+        # 外层错误处理：如果处理过程中出现错误，保留已完成的segments
+        log(f"[Segmented] ERROR: Processing failed: {outer_error}", "error")
+        if segment_files:
+            log(f"[Segmented] Some segments may be preserved. Check: {tmp_dir}", "warning")
+        raise
+    finally:
+        # 注意：临时文件清理已在成功合并时完成
+        # 如果合并失败，文件会被保留以便恢复
+        pass
+
 def run_inference_chunked(pipe, frames, device, dtype, args, streaming_writer, chunk_size_frames, N_original):
     """按chunk流式处理视频，避免创建整个canvas。
     
@@ -1837,7 +3061,13 @@ def run_inference_chunked(pipe, frames, device, dtype, args, streaming_writer, c
     
     # 计算需要多少个chunks
     num_chunks = (N + chunk_size_frames - 1) // chunk_size_frames
-    log(f"[Streaming] Processing video in {num_chunks} chunks (chunk size: {chunk_size_frames} frames)", "info")
+    overlap_frames = getattr(args, 'segment_overlap', 2)
+    log(f"[Streaming] Processing video in {num_chunks} chunks (chunk size: {chunk_size_frames} frames, overlap: {overlap_frames} frames)", "info")
+    
+    # 进度报告设置（仅在worker进程中）
+    report_progress_to_queue = False
+    if hasattr(args, '_is_worker') and args._is_worker and hasattr(args, '_result_queue'):
+        report_progress_to_queue = True
     
     # 处理每个chunk
     for chunk_idx in range(num_chunks):
@@ -1845,7 +3075,6 @@ def run_inference_chunked(pipe, frames, device, dtype, args, streaming_writer, c
         end_frame = min((chunk_idx + 1) * chunk_size_frames, N)
         
         # 提取chunk（需要包含一些重叠帧以确保边界平滑）
-        overlap_frames = 10  # 每个chunk前后各10帧重叠
         chunk_start = max(0, start_frame - overlap_frames)
         chunk_end = min(N, end_frame + overlap_frames)
         
@@ -1917,13 +3146,42 @@ def run_inference_chunked(pipe, frames, device, dtype, args, streaming_writer, c
         if chunk_output.shape[0] > actual_frames_needed:
             chunk_output = chunk_output[:actual_frames_needed]
         
-        # 流式写入这个chunk
+        # 流式写入这个chunk（或累积到内存）
         streaming_writer.write_frames(chunk_output)
-        log(f"[Streaming] Written chunk {chunk_idx + 1}/{num_chunks} ({chunk_output.shape[0]} frames)", "info")
+        log(f"[Streaming] Processed chunk {chunk_idx + 1}/{num_chunks} ({chunk_output.shape[0]} frames)", "info")
         
-        # 释放内存
-        del chunk_output, chunk_frames, chunk_canvas, chunk_weight_canvas
+        # 报告进度到主进程（worker模式下，每完成一个chunk报告一次）
+        if report_progress_to_queue:
+            # 计算已处理的帧数（基于chunk进度）
+            frames_processed = min((chunk_idx + 1) * chunk_size_frames, N_original)
+            progress_percent = ((chunk_idx + 1) / num_chunks) * 100
+            try:
+                args._result_queue.put({
+                    'worker_id': args._worker_id,
+                    'type': 'tile_progress',
+                    'tiles_processed': chunk_idx + 1,  # 使用chunk索引作为进度
+                    'total_tiles': num_chunks,
+                    'frames_processed': frames_processed,
+                    'total_frames': args._total_frames,
+                    'progress_percent': progress_percent,
+                    'start_idx': args._start_idx,
+                    'end_idx': args._end_idx
+                }, block=False)
+            except:
+                pass
+        
+        # 释放内存（但保留chunk_output的引用，如果streaming_writer需要累积）
+        del chunk_frames, chunk_canvas, chunk_weight_canvas
         clean_vram()
+    
+    # 检查 streaming_writer 是否有累积的结果（用于 worker 进程）
+    if hasattr(streaming_writer, 'chunks') and streaming_writer.chunks:
+        # 合并所有 chunk 的结果
+        final_output = torch.cat(streaming_writer.chunks, dim=0)
+        # 裁剪回原始帧数
+        if final_output.shape[0] > N_original:
+            final_output = final_output[:N_original]
+        return final_output
     
     # 流式模式下返回None（视频已保存到文件）
     return None
@@ -1971,6 +3229,7 @@ def run_inference(pipe, frames, device, dtype, args, streaming_writer=None):
     新增功能：
     1. 动态batch_size：根据显存情况同时处理多个tile
     2. 流式处理：当内存需求过大时，将视频分成chunks，每个chunk独立处理并流式写入
+    3. 分段处理：如果启用 --segmented，将视频分成多个sub-segments独立处理
     
     Args:
         streaming_writer: 可选的StreamingVideoWriter实例，用于流式写入
@@ -1978,6 +3237,11 @@ def run_inference(pipe, frames, device, dtype, args, streaming_writer=None):
     # 基本输入校验
     if frames is None or not hasattr(frames, 'shape') or frames.ndim != 4 or frames.shape[0] == 0:
         raise RuntimeError("[run_inference] Input frames is empty. Please check video decoding and path.")
+    
+    # 如果启用了分段处理模式，直接使用分段处理
+    if getattr(args, 'segmented', False):
+        log(f"[Segmented] Segmented processing mode enabled (--segmented)", "info")
+        return run_inference_segmented(pipe, frames, device, dtype, args)
     
     # 保存原始帧数（用于最后裁剪）
     N_original = frames.shape[0]
@@ -1991,27 +3255,6 @@ def run_inference(pipe, frames, device, dtype, args, streaming_writer=None):
 
     # 记录 tile 相关参数状态（帮助调试）
     log(f"[Tile Settings] tiled_dit={args.tiled_dit} (type: {type(args.tiled_dit).__name__}), tiled_vae={args.tiled_vae} (type: {type(args.tiled_vae).__name__}), tile_size={args.tile_size}, tile_overlap={args.tile_overlap}", "info")
-    
-    # 详细说明 DiT tile 和 VAE tile 的影响
-    if args.tiled_dit:
-        log(f"[Tile Settings] ✓ DiT tile 已启用", "info")
-        log(f"[Tile Settings]   - DiT tile 影响：主要在 latent 空间处理，对最终图像的影响相对较小", "info")
-        log(f"[Tile Settings]   - DiT tile 可能产生的方块：通常不明显，因为后续 VAE 解码会平滑边界", "info")
-    else:
-        log(f"[Tile Settings] ✗ DiT tile 已禁用（整图处理）", "info")
-    
-    if args.tiled_vae:
-        log(f"[Tile Settings] ✓ VAE tile 已启用", "warning")
-        log(f"[Tile Settings]   - VAE tile 影响：直接在像素空间处理，对最终图像的影响最大！", "warning")
-        log(f"[Tile Settings]   - VAE tile 可能产生的方块：非常明显，因为是在最终输出图像上直接拼接", "warning")
-        log(f"[Tile Settings]   - 建议：如果看到明显的方块划分，优先禁用 VAE tile (--tiled_vae False)", "warning")
-    else:
-        log(f"[Tile Settings] ✗ VAE tile 已禁用（整图处理，无方块边界）", "info")
-    
-    log(f"[Tile Settings] 总结：对最终成像方块划分影响最大的是 VAE tile，而不是 DiT tile", "info")
-    
-    # 重要提示：如果使用多GPU模式，segments之间的边界也可能产生分块
-    log(f"[Tile Settings] 注意：多GPU模式下，视频会被分割成多个segments处理，segments边界也可能产生可见的分块", "warning")
 
     # 瓦片 DiT 路径：参考 nodes.py 的实现
     if args.tiled_dit:
@@ -2079,10 +3322,17 @@ def run_inference(pipe, frames, device, dtype, args, streaming_writer=None):
                 f"Consider using smaller scale or shorter video.", "warning")
         
         # 检查是否需要使用chunk流式处理
-        # 基于系统可用内存的比例来决定是否使用chunk流式处理
+        # 如果用户启用了 --streaming，或者 streaming_writer 不为 None，则检查是否需要 chunk 流式处理
         use_chunk_streaming = False
         chunk_size_frames = None
-        if streaming_writer is not None:
+        if args.streaming or streaming_writer is not None:
+            try:
+                sys_used, sys_total = get_system_memory_info()
+                sys_free = sys_total - sys_used
+            except:
+                sys_total = 200  # 默认值
+                sys_free = 100
+            
             # 计算内存阈值：使用系统可用内存的30%作为阈值
             # 对于大内存系统（>200GB），使用30%；对于小内存系统，使用40%
             if sys_total > 200:
@@ -2092,28 +3342,64 @@ def run_inference(pipe, frames, device, dtype, args, streaming_writer=None):
             
             memory_threshold_gb = sys_free * memory_threshold_ratio
             
-            # 如果canvas内存需求超过阈值，使用chunk流式处理
-            if total_required_gb > memory_threshold_gb:
+            # 如果用户启用了 --streaming，或者 canvas 内存需求超过阈值，使用chunk流式处理
+            if args.streaming or total_required_gb > memory_threshold_gb:
                 use_chunk_streaming = True
-                # 计算合适的chunk大小：每个chunk的canvas不超过可用内存的15%
-                # 这样确保有足够的内存用于其他操作
-                chunk_canvas_memory_ratio = 0.15
+                # 计算合适的chunk大小：每个chunk的canvas不超过可用内存的10%（更保守，考虑VAE解码的额外内存）
+                # VAE解码需要额外的内存（latents、中间激活等），所以需要更小的chunk
+                # 如果 tiled_vae=False，需要更小的chunk（因为VAE会解码整个chunk）
+                if args.tiled_vae:
+                    chunk_canvas_memory_ratio = 0.12  # VAE tile时可以用稍大的chunk
+                else:
+                    chunk_canvas_memory_ratio = 0.08  # VAE不tile时，需要更小的chunk（VAE解码整个chunk需要更多内存）
+                
                 chunk_canvas_memory_gb = sys_free * chunk_canvas_memory_ratio
-                # 但至少保留2GB，最多使用20GB（避免在小内存系统上chunk太大）
-                chunk_canvas_memory_gb = max(2.0, min(chunk_canvas_memory_gb, 20.0))
+                # 但至少保留1.5GB，最多使用15GB（更保守，避免VAE解码时OOM）
+                chunk_canvas_memory_gb = max(1.5, min(chunk_canvas_memory_gb, 15.0))
                 
                 chunk_size_frames = int((chunk_canvas_memory_gb * (1024**3)) / (H * args.scale * W * args.scale * C * 2 * 2))  # 2个canvas
                 # 确保chunk大小至少为21帧（模型要求），且是8的倍数（对齐要求）
                 chunk_size_frames = max(21, chunk_size_frames)
                 chunk_size_frames = largest_8n1_leq(chunk_size_frames)
-                # 限制最大chunk大小为500帧，避免单个chunk仍然太大
-                chunk_size_frames = min(chunk_size_frames, 500)
-                log(f"[Streaming] Canvas memory requirement ({total_required_gb:.2f} GB) exceeds threshold ({memory_threshold_gb:.2f} GB, {memory_threshold_ratio*100:.0f}% of available RAM). "
-                    f"Will use chunk streaming with chunk size: {chunk_size_frames} frames (chunk canvas: {chunk_canvas_memory_gb:.2f} GB)", "info")
+                # 限制最大chunk大小为300帧（更保守，避免VAE解码时OOM）
+                chunk_size_frames = min(chunk_size_frames, 300)
+                
+                reason = "user enabled --streaming" if args.streaming else f"canvas memory ({total_required_gb:.2f} GB) exceeds threshold ({memory_threshold_gb:.2f} GB)"
+                vae_note = " (VAE not tiled, using smaller chunks)" if not args.tiled_vae else " (VAE tiled)"
+                log(f"[Streaming] {reason}. Will use chunk streaming with chunk size: {chunk_size_frames} frames "
+                    f"(chunk canvas: {chunk_canvas_memory_gb:.2f} GB, {chunk_canvas_memory_ratio*100:.0f}% of available RAM{vae_note})", "info")
         
-        # 如果使用chunk流式处理，不需要创建整个canvas
+        # 如果使用chunk流式处理
         if use_chunk_streaming:
-            return run_inference_chunked(pipe, frames, device, dtype, args, streaming_writer, chunk_size_frames, N_original)
+            # 如果 streaming_writer 为 None（例如在 worker 进程中），创建一个临时的累积器
+            if streaming_writer is None:
+                # 在 worker 进程中，我们需要累积所有 chunk 的结果
+                # 创建一个临时列表来存储 chunk 结果
+                chunk_results = []
+                
+                # 创建一个临时的 StreamingVideoWriter，但重写 write_frames 来累积结果
+                class ChunkAccumulator:
+                    def __init__(self):
+                        self.chunks = []
+                    
+                    def write_frames(self, frames):
+                        self.chunks.append(frames.clone())
+                
+                accumulator = ChunkAccumulator()
+                run_inference_chunked(pipe, frames, device, dtype, args, accumulator, chunk_size_frames, N_original)
+                
+                # 合并所有 chunk 的结果
+                if accumulator.chunks:
+                    final_output = torch.cat(accumulator.chunks, dim=0)
+                    # 裁剪回原始帧数
+                    if final_output.shape[0] > N_original:
+                        final_output = final_output[:N_original]
+                    return final_output
+                else:
+                    raise RuntimeError("No chunks were processed in streaming mode")
+            else:
+                # 如果有 streaming_writer，直接使用 chunk 流式处理
+                return run_inference_chunked(pipe, frames, device, dtype, args, streaming_writer, chunk_size_frames, N_original)
         
         # 如果提供了streaming_writer但不需要chunk处理，仍然需要创建canvas（但会在最后流式写入）
         # 这种情况下，我们仍然创建canvas，但在最后通过streaming_writer写入
@@ -2182,6 +3468,14 @@ def run_inference(pipe, frames, device, dtype, args, streaming_writer=None):
         total_tiles = len(tile_coords)
         processed = 0
         
+        # 进度报告设置（仅在worker进程中）
+        report_progress_to_queue = False
+        last_reported_tiles = 0
+        progress_report_interval = max(1, total_tiles // 10)  # 每10%报告一次
+        
+        if hasattr(args, '_is_worker') and args._is_worker and hasattr(args, '_result_queue'):
+            report_progress_to_queue = True
+        
         for batch_idx, tile_batch in enumerate(tqdm(tile_batches, desc="Processing Tile Batches")):
             # 处理当前batch的tiles
             results = process_tile_batch(pipe, frames, device, dtype, args, tile_batch, batch_idx)
@@ -2202,6 +3496,27 @@ def run_inference(pipe, frames, device, dtype, args, streaming_writer=None):
 
                 processed += 1
                 log(f"[FlashVSR] Processed tile {processed}/{total_tiles}: ({x1},{y1})-({x2},{y2})", "info")
+            
+            # 报告进度到主进程（worker模式下，每10%报告一次）
+            if report_progress_to_queue and (processed - last_reported_tiles >= progress_report_interval or processed == total_tiles):
+                # 计算已处理的帧数（基于tile进度估算）
+                frames_processed = int((processed / total_tiles) * args._total_frames)
+                progress_percent = (processed / total_tiles) * 100
+                try:
+                    args._result_queue.put({
+                        'worker_id': args._worker_id,
+                        'type': 'tile_progress',
+                        'tiles_processed': processed,
+                        'total_tiles': total_tiles,
+                        'frames_processed': frames_processed,
+                        'total_frames': args._total_frames,
+                        'progress_percent': progress_percent,
+                        'start_idx': args._start_idx,
+                        'end_idx': args._end_idx
+                    }, block=False)
+                except:
+                    pass
+                last_reported_tiles = processed
                 
             # 每次batch后清理显存
             clean_vram()
@@ -2287,7 +3602,57 @@ def main(args):
     log(f"  --tile_size = {args.tile_size}", "info")
     log(f"  --tile_overlap = {args.tile_overlap}", "info")
     log(f"  --unload_dit = {args.unload_dit}", "info")
+    log(f"  --segment_overlap = {getattr(args, 'segment_overlap', 2)}", "info")
+    log(f"  --segmented = {getattr(args, 'segmented', False)}", "info")
     log("=" * 80, "info")
+    
+    # 读取视频获取总帧数（用于统一checkpoint系统）
+    frames, input_fps = read_video_to_tensor(args.input)
+    total_frames = frames.shape[0]
+    
+    # 统一的断点续跑检查（如果启用resume）
+    if getattr(args, 'resume', False) and not getattr(args, 'clean_checkpoint', False):
+        log("[Resume] Scanning for completed frames...", "info")
+        # 只有在明确指定 --resume 时才扫描已完成的帧
+        if getattr(args, 'resume', False):
+            completed_ranges = scan_all_completed_frames(args.input, args, total_frames)
+        else:
+            # 没有指定 --resume，默认覆盖模式：不扫描已完成的帧
+            completed_ranges = []
+        
+        if completed_ranges:
+            log(f"[Resume] Found {len(completed_ranges)} completed frame ranges:", "info")
+            total_completed = 0
+            for start, end, path, mode in completed_ranges:
+                frames_count = end - start
+                total_completed += frames_count
+                log(f"  - Frames {start}-{end} ({frames_count} frames) from {mode}: {os.path.basename(path)}", "info")
+            
+            # 检查是否全部完成
+            if total_completed >= total_frames:
+                log("[Resume] All frames already processed! Merging results...", "info")
+                output_path = args.output if args.output else os.path.join("/app/output", os.path.basename(args.input).replace(".mp4", "_out.mp4"))
+                merge_all_completed_frames(completed_ranges, output_path, input_fps, total_frames)
+                del frames
+                clean_vram()
+                total_time = time.time() - total_start
+                log(f"Output saved to {output_path}", "finish")
+                log(f"[Total] Total elapsed time: {format_duration(total_time)}", "finish")
+                return
+            
+            # 找出未完成的帧范围
+            missing_ranges = find_missing_frame_ranges(total_frames, completed_ranges)
+            if missing_ranges:
+                log(f"[Resume] Found {len(missing_ranges)} missing frame ranges:", "info")
+                for start, end in missing_ranges:
+                    log(f"  - Frames {start}-{end} ({end-start} frames)", "info")
+                
+                # 只处理缺失的帧范围
+                # 注意：这里需要根据用户选择的模式（multi_gpu或segmented）来处理
+                # 目前先提示用户，后续可以扩展为自动处理缺失范围
+                log("[Resume] Processing missing frames...", "info")
+                # TODO: 实现只处理缺失帧范围的逻辑
+                # 目前继续正常流程，但会跳过已完成的segments
     
     # 处理多GPU模式
     if args.multi_gpu:
@@ -2309,10 +3674,7 @@ def main(args):
             else:
                 wan_video_dit.USE_BLOCK_ATTN = True
             
-            # 读取视频
-            frames, input_fps = read_video_to_tensor(args.input)
-            
-            # 使用多GPU处理
+            # 使用多GPU处理（frames已在上面读取）
             output = run_inference_multi_gpu(frames, devices, args, input_fps)
             
             # 保存视频（流式模式下output为None，视频已保存）
@@ -2323,6 +3685,113 @@ def main(args):
             else:
                 # 流式模式下，视频已保存到args.output
                 output_dir = args.output if args.output else os.path.join("/app/output", os.path.basename(args.input).replace(".mp4", "_out.mp4"))
+            
+            # 验证视频文件是否成功保存
+            if not os.path.exists(output_dir):
+                raise RuntimeError(f"Video file was not created: {output_dir}")
+            file_size = os.path.getsize(output_dir)
+            if file_size == 0:
+                raise RuntimeError(f"Video file is empty: {output_dir}")
+            log(f"[Verify] Video file verified: {output_dir} ({file_size / (1024**2):.2f} MB)", "info")
+            
+            # 只有在视频成功保存并验证后才清理临时文件和checkpoint
+            log("[Cleanup] Cleaning up temporary files and checkpoints...", "info")
+            
+            # 清理multi_gpu临时文件
+            import glob
+            video_dir_name = get_video_based_dir_name(args.input, args.scale)
+            multi_gpu_tmp = os.path.join("/tmp", "flashvsr_multigpu", video_dir_name)
+            if os.path.exists(multi_gpu_tmp):
+                worker_files = glob.glob(os.path.join(multi_gpu_tmp, "worker_*.pt"))
+                for worker_file in worker_files:
+                    try:
+                        os.remove(worker_file)
+                        log(f"[Cleanup] Removed: {worker_file}", "info")
+                    except:
+                        pass
+                # 如果目录为空，尝试删除目录
+                try:
+                    if not os.listdir(multi_gpu_tmp):
+                        os.rmdir(multi_gpu_tmp)
+                except:
+                    pass
+            
+            # 清理segmented临时文件
+            video_dir_name = get_video_based_dir_name(args.input, args.scale)
+            segmented_base = "/tmp/flashvsr_segments"
+            if os.path.exists(segmented_base):
+                # 优先使用基于视频名称的目录
+                segment_dir = os.path.join(segmented_base, video_dir_name)
+                if os.path.exists(segment_dir) and os.path.isdir(segment_dir):
+                    segment_files = glob.glob(os.path.join(segment_dir, "segment_*.pt"))
+                    for seg_file in segment_files:
+                        try:
+                            os.remove(seg_file)
+                            log(f"[Cleanup] Removed: {seg_file}", "info")
+                        except:
+                            pass
+                    # 如果目录为空，尝试删除目录
+                    try:
+                        if not os.listdir(segment_dir):
+                            os.rmdir(segment_dir)
+                    except:
+                        pass
+                else:
+                    # 向后兼容：查找旧的基于hash的目录
+                    for segment_dir_name in os.listdir(segmented_base):
+                        segment_dir = os.path.join(segmented_base, segment_dir_name)
+                        if not os.path.isdir(segment_dir):
+                            continue
+                        # 检查是否有metadata文件指向当前输入
+                        metadata_files = glob.glob(os.path.join(segment_dir, "segment_*.json"))
+                        if metadata_files:
+                            try:
+                                with open(metadata_files[0], 'r') as f:
+                                    metadata = json.load(f)
+                                # 如果metadata中有worker信息，说明是multi_gpu+segmented模式，可以清理
+                                if metadata.get('is_worker_mode', False):
+                                    segment_files = glob.glob(os.path.join(segment_dir, "segment_*.pt"))
+                                    for seg_file in segment_files:
+                                        try:
+                                            os.remove(seg_file)
+                                            log(f"[Cleanup] Removed: {seg_file}", "info")
+                                        except:
+                                            pass
+                            except:
+                                pass
+            
+            # 清理checkpoint（可选，如果用户想要保留checkpoint可以跳过）
+            if not getattr(args, 'keep_checkpoint', False):
+                video_dir_name = get_video_based_dir_name(args.input, args.scale)
+                multi_gpu_checkpoint_dir = os.path.join('/tmp', 'flashvsr_checkpoints')
+                if os.path.exists(multi_gpu_checkpoint_dir):
+                    # 优先清理基于视频名称的checkpoint目录
+                    checkpoint_path = os.path.join(multi_gpu_checkpoint_dir, video_dir_name)
+                    if os.path.exists(checkpoint_path) and os.path.isdir(checkpoint_path):
+                        try:
+                            import shutil
+                            shutil.rmtree(checkpoint_path)
+                            log(f"[Cleanup] Removed checkpoint: {checkpoint_path}", "info")
+                        except:
+                            pass
+                    # 向后兼容：清理旧的基于hash的checkpoint目录
+                    for checkpoint_dir_name in os.listdir(multi_gpu_checkpoint_dir):
+                        checkpoint_path = os.path.join(multi_gpu_checkpoint_dir, checkpoint_dir_name)
+                        if not os.path.isdir(checkpoint_path):
+                            continue
+                        # 跳过已经清理过的目录
+                        if checkpoint_dir_name == video_dir_name:
+                            continue
+                        try:
+                            checkpoint_data = load_checkpoint(checkpoint_path)
+                            # 检查是否匹配当前输入
+                            # 这里简化处理，如果checkpoint中有segment信息，就清理
+                            if checkpoint_data and any(k.startswith('segment_') for k in checkpoint_data.keys()):
+                                import shutil
+                                shutil.rmtree(checkpoint_path)
+                                log(f"[Cleanup] Removed checkpoint: {checkpoint_path}", "info")
+                        except:
+                            pass
             
             del frames
             clean_vram()
@@ -2362,38 +3831,42 @@ def main(args):
     pipe = init_pipeline(args.mode, _device, dtype, args.model_dir)
     frames, input_fps = read_video_to_tensor(args.input)
     
-    # 检查是否需要流式处理（对于长视频，自动启用流式处理）
+    # 检查是否需要流式处理（用户控制，类似 --multi_gpu）
     N, H, W, C = frames.shape
     # 估算canvas内存需求
     num_aligned_frames = largest_8n1_leq(N + 4) - 4
     estimated_canvas_memory_gb = (num_aligned_frames * H * args.scale * W * args.scale * C * 2 * 2) / (1024**3)  # 2个canvas，float16
     
-    # 基于系统可用内存的比例来决定是否启用流式处理
-    try:
-        sys_used, sys_total = get_system_memory_info()
-        sys_free = sys_total - sys_used
-        
-        # 计算内存阈值：使用系统可用内存的30%作为阈值
-        # 对于大内存系统（>200GB），使用30%；对于小内存系统，使用40%
-        if sys_total > 200:
-            memory_threshold_ratio = 0.30  # 大内存系统使用30%
-        else:
-            memory_threshold_ratio = 0.40  # 小内存系统使用40%
-        
-        memory_threshold_gb = sys_free * memory_threshold_ratio
-        use_streaming = estimated_canvas_memory_gb > memory_threshold_gb
-        
-        if use_streaming:
-            log(f"[Streaming] Estimated canvas memory: {estimated_canvas_memory_gb:.2f} GB exceeds threshold "
-                f"({memory_threshold_gb:.2f} GB, {memory_threshold_ratio*100:.0f}% of available RAM {sys_free:.2f} GB). "
-                f"Auto-enabling streaming mode.", "info")
-    except:
-        # 如果无法获取系统内存信息，使用保守的默认值（30GB）
-        memory_threshold_gb = 30.0
-        use_streaming = estimated_canvas_memory_gb > memory_threshold_gb
-        if use_streaming:
-            log(f"[Streaming] Estimated canvas memory: {estimated_canvas_memory_gb:.2f} GB exceeds threshold "
-                f"({memory_threshold_gb:.2f} GB, fallback). Auto-enabling streaming mode.", "info")
+    # 用户控制流式处理
+    use_streaming = False
+    if args.streaming:
+        # 用户明确启用流式处理
+        use_streaming = True
+        log(f"[Streaming] Streaming mode enabled by user (--streaming)", "info")
+    else:
+        # 如果用户未启用，但内存需求过大，给出警告建议
+        try:
+            sys_used, sys_total = get_system_memory_info()
+            sys_free = sys_total - sys_used
+            
+            # 计算内存阈值：使用系统可用内存的30%作为阈值
+            # 对于大内存系统（>200GB），使用30%；对于小内存系统，使用40%
+            if sys_total > 200:
+                memory_threshold_ratio = 0.30  # 大内存系统使用30%
+            else:
+                memory_threshold_ratio = 0.40  # 小内存系统使用40%
+            
+            memory_threshold_gb = sys_free * memory_threshold_ratio
+            
+            if estimated_canvas_memory_gb > memory_threshold_gb:
+                log(f"[WARNING] Estimated canvas memory ({estimated_canvas_memory_gb:.2f} GB) exceeds threshold "
+                    f"({memory_threshold_gb:.2f} GB, {memory_threshold_ratio*100:.0f}% of available RAM {sys_free:.2f} GB). "
+                    f"Consider using --streaming to avoid OOM.", "warning")
+        except:
+            # 如果无法获取系统内存信息，使用保守的默认值（30GB）
+            if estimated_canvas_memory_gb > 30.0:
+                log(f"[WARNING] Estimated canvas memory ({estimated_canvas_memory_gb:.2f} GB) is large. "
+                    f"Consider using --streaming to avoid OOM.", "warning")
     
     streaming_writer = None
     
@@ -2419,6 +3892,66 @@ def main(args):
         output_dir = args.output if args.output else os.path.join("/app/output", os.path.basename(args.input).replace(".mp4", "_out.mp4"))
         save_video(output, output_dir, fps=input_fps)
         del output
+    
+    # 验证视频文件是否成功保存
+    if not os.path.exists(output_dir):
+        raise RuntimeError(f"Video file was not created: {output_dir}")
+    file_size = os.path.getsize(output_dir)
+    if file_size == 0:
+        raise RuntimeError(f"Video file is empty: {output_dir}")
+    log(f"[Verify] Video file verified: {output_dir} ({file_size / (1024**2):.2f} MB)", "info")
+    
+    # 只有在视频成功保存并验证后才清理临时文件
+    log("[Cleanup] Cleaning up temporary files...", "info")
+    
+    # 清理segmented临时文件（如果使用了segmented模式）
+    if getattr(args, 'segmented', False):
+        video_dir_name = get_video_based_dir_name(args.input, args.scale)
+        segmented_base = "/tmp/flashvsr_segments"
+        if os.path.exists(segmented_base):
+            import glob
+            # 优先使用基于视频名称的目录
+            segment_dir = os.path.join(segmented_base, video_dir_name)
+            if os.path.exists(segment_dir) and os.path.isdir(segment_dir):
+                segment_files = glob.glob(os.path.join(segment_dir, "segment_*.pt"))
+                for seg_file in segment_files:
+                    try:
+                        os.remove(seg_file)
+                        log(f"[Cleanup] Removed: {seg_file}", "info")
+                    except:
+                        pass
+                # 如果目录为空，尝试删除目录
+                try:
+                    if not os.listdir(segment_dir):
+                        os.rmdir(segment_dir)
+                except:
+                    pass
+            else:
+                # 向后兼容：查找旧的基于hash的目录
+                for segment_dir_name in os.listdir(segmented_base):
+                    segment_dir = os.path.join(segmented_base, segment_dir_name)
+                    if not os.path.isdir(segment_dir):
+                        continue
+                    # 跳过已经检查过的目录
+                    if segment_dir_name == video_dir_name:
+                        continue
+                    # 检查metadata文件是否匹配当前输入
+                    metadata_files = glob.glob(os.path.join(segment_dir, "segment_*.json"))
+                    if metadata_files:
+                        try:
+                            with open(metadata_files[0], 'r') as f:
+                                metadata = json.load(f)
+                            # 如果metadata中没有worker信息，说明是单GPU的segmented模式
+                            if not metadata.get('is_worker_mode', False):
+                                segment_files = glob.glob(os.path.join(segment_dir, "segment_*.pt"))
+                                for seg_file in segment_files:
+                                    try:
+                                        os.remove(seg_file)
+                                        log(f"[Cleanup] Removed: {seg_file}", "info")
+                                    except:
+                                        pass
+                        except:
+                            pass
     
     del pipe, frames
     clean_vram()
@@ -2464,6 +3997,12 @@ if __name__ == "__main__":
     # 新增优化参数
     parser.add_argument("--multi_gpu", action="store_true", help="Enable multi-GPU parallel processing (splits video by frames)")
     parser.add_argument("--adaptive_batch_size", action="store_true", help="Enable adaptive batch size for tiles (dynamically adjust based on GPU memory)")
+    parser.add_argument("--streaming", action="store_true", help="Enable streaming mode for long videos (processes video in chunks to reduce memory usage)")
+    parser.add_argument("--segmented", action="store_true", help="Enable segmented processing mode (processes video in sub-segments to reduce memory usage, similar to --multi_gpu but for single worker)")
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint: automatically detects and merges completed frames from previous runs (works with --multi_gpu and --segmented)")
+    parser.add_argument("--clean-checkpoint", action="store_true", help="Clean checkpoint directory before starting (disable resume)")
+    parser.add_argument("--segment_overlap", type=int, default=2, help="Number of overlap frames between segments/chunks (default: 2, range: 1-10, recommended: 1-5)")
+    parser.add_argument("--max-segment-frames", type=int, default=None, help="Maximum frames per segment in segmented mode (default: auto-calculate based on memory, higher value = fewer segments = faster but more memory)")
     
     args = parser.parse_args()
     

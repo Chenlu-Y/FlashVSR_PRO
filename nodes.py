@@ -135,15 +135,53 @@ def calculate_tile_coords(height, width, tile_size, overlap):
     return coords
 
 def create_feather_mask(size, overlap):
+    """Create blending mask for overlapping tiles with Gaussian blur for smoother blending.
+    
+    Args:
+        size: (H, W) tuple of mask dimensions
+        overlap: Overlap size in pixels (determined by user parameter)
+    
+    Returns:
+        mask: (1, 1, H, W) tensor with smooth blending weights
+    """
+    import torch.nn.functional as F
+    
     H, W = size
-    mask = torch.ones(1, 1, H, W)
-    ramp = torch.linspace(0, 1, overlap)
+    mask = torch.ones(1, 1, H, W, dtype=torch.float32)
     
-    mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp.view(1, 1, 1, -1))
-    mask[:, :, :, -overlap:] = torch.minimum(mask[:, :, :, -overlap:], ramp.flip(0).view(1, 1, 1, -1))
+    # 创建线性ramp作为基础
+    ramp = torch.linspace(0, 1, overlap, dtype=torch.float32)
     
-    mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp.view(1, 1, -1, 1))
-    mask[:, :, -overlap:, :] = torch.minimum(mask[:, :, -overlap:, :], ramp.flip(0).view(1, 1, -1, 1))
+    # 应用高斯模糊使过渡更平滑
+    # 使用1D高斯核，sigma约为overlap的1/3，使过渡更自然
+    sigma = max(1.0, overlap / 3.0)
+    kernel_size = int(2 * sigma * 2) + 1  # 确保是奇数
+    if kernel_size > 1 and kernel_size <= overlap:
+        # 创建1D高斯核
+        x = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
+        gaussian_1d = torch.exp(-0.5 * (x / sigma) ** 2)
+        gaussian_1d = gaussian_1d / gaussian_1d.sum()
+        
+        # 对ramp应用高斯模糊
+        ramp_padded = F.pad(ramp.unsqueeze(0).unsqueeze(0), (kernel_size//2, kernel_size//2), mode='reflect')
+        ramp_blurred = F.conv1d(ramp_padded, gaussian_1d.unsqueeze(0).unsqueeze(0), padding=0)
+        ramp = ramp_blurred.squeeze()
+        # 重新归一化到[0, 1]
+        if ramp.max() > ramp.min():
+            ramp = (ramp - ramp.min()) / (ramp.max() - ramp.min())
+    
+    # 应用ramp到四个边缘
+    ramp_h = ramp.view(1, 1, -1, 1)  # 用于垂直边缘
+    ramp_w = ramp.view(1, 1, 1, -1)  # 用于水平边缘
+    
+    # 左边缘
+    mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp_w)
+    # 右边缘
+    mask[:, :, :, -overlap:] = torch.minimum(mask[:, :, :, -overlap:], ramp_w.flip(-1))
+    # 上边缘
+    mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp_h)
+    # 下边缘
+    mask[:, :, -overlap:, :] = torch.minimum(mask[:, :, -overlap:, :], ramp_h.flip(-2))
     
     return mask
 
