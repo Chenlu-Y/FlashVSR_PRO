@@ -24,6 +24,64 @@ def log(msg, level="info"):
     }.get(level, "[INFO]")
     print(f"{prefix} {msg}")
 
+def save_video_streaming(frames_tensor, path, fps=30, batch_size=10):
+    """分批保存视频，避免一次性处理所有帧"""
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+    
+    num_frames, h, w, c = frames_tensor.shape
+    log(f"准备分批保存视频: {num_frames} 帧, {w}x{h}, {fps} fps (每批 {batch_size} 帧)", "info")
+    
+    # 使用 FFmpeg 管道进行流式编码
+    import subprocess
+    
+    # 启动 FFmpeg 进程
+    cmd = [
+        'ffmpeg',
+        '-y',
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-s', f'{w}x{h}',
+        '-pix_fmt', 'rgb24',
+        '-r', str(fps),
+        '-i', 'pipe:0',
+        '-c:v', 'libx264',
+        '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart',
+        '-crf', '18',
+        path
+    ]
+    
+    try:
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        
+        frame_count = 0
+        # 分批处理
+        for batch_start in range(0, num_frames, batch_size):
+            batch_end = min(batch_start + batch_size, num_frames)
+            batch = frames_tensor[batch_start:batch_end]
+            
+            # 转换为numpy并写入
+            batch_np = (batch.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
+            for frame in batch_np:
+                process.stdin.write(frame.tobytes())
+                frame_count += 1
+            
+            if batch_end % 50 == 0 or batch_end == num_frames:
+                log(f"已处理 {frame_count}/{num_frames} 帧 ({frame_count*100//num_frames}%)...", "info")
+        
+        process.stdin.close()
+        process.wait()
+        
+        if process.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
+            log(f"成功使用 FFmpeg 流式保存视频: {path} ({frame_count} 帧)", "info")
+            return True
+        else:
+            stderr = process.stderr.read().decode('utf-8', errors='ignore')
+            raise RuntimeError(f"FFmpeg 失败: {stderr[:500]}")
+    except Exception as e:
+        log(f"流式保存失败: {e}，回退到普通方法", "warning")
+        return False
+
 def save_video(frames, path, fps=30):
     """Save tensor video frames to MP4 with H.264 encoding for Windows compatibility.
     
@@ -245,13 +303,41 @@ def main():
     
     try:
         log(f"加载恢复的推理结果: {recovered_file}", "info")
-        frames = torch.load(recovered_file, map_location='cpu')
         
-        log(f"加载成功: shape={frames.shape}, dtype={frames.dtype}", "info")
+        # 使用流式加载和保存，避免一次性加载115GB到内存
+        log("使用流式处理模式（避免内存溢出）...", "info")
+        
+        # 先加载数据（由于是.pt文件，需要完整加载）
+        log("读取文件数据（这可能需要几分钟，请耐心等待）...", "info")
+        checkpoint = torch.load(recovered_file, map_location='cpu')
+        
+        # 如果是字典，提取tensor
+        if isinstance(checkpoint, dict):
+            # 尝试找到tensor
+            frames = None
+            for key in ['frames', 'output', 'data', 'tensor']:
+                if key in checkpoint and isinstance(checkpoint[key], torch.Tensor):
+                    frames = checkpoint[key]
+                    break
+            if frames is None:
+                # 取第一个tensor值
+                for v in checkpoint.values():
+                    if isinstance(v, torch.Tensor):
+                        frames = v
+                        break
+            if frames is None:
+                raise ValueError("无法从checkpoint中找到tensor数据")
+        else:
+            frames = checkpoint
+        
+        log(f"数据信息: shape={frames.shape}, dtype={frames.dtype}", "info")
         
         # 验证格式
         if len(frames.shape) != 4 or frames.shape[3] != 3:
             raise ValueError(f"无效的帧格式: {frames.shape}，期望 (F, H, W, 3)")
+        
+        num_frames, h, w, c = frames.shape
+        log(f"总帧数: {num_frames}, 分辨率: {w}x{h}", "info")
         
         # 确保值在 [0, 1] 范围内
         if frames.dtype != torch.float32 and frames.dtype != torch.float16:
@@ -260,7 +346,13 @@ def main():
             frames = frames.clamp(0, 1)
         
         log(f"保存视频到: {output_video} (FPS: {fps})", "info")
-        save_video(frames, output_video, fps=fps)
+        log("开始编码（这可能需要较长时间，请耐心等待）...", "info")
+        
+        # 使用分批流式保存（避免一次性处理所有帧）
+        if not save_video_streaming(frames, output_video, fps=fps, batch_size=10):
+            # 如果流式保存失败，回退到普通方法（但会占用大量内存）
+            log("流式保存失败，使用普通方法（需要大量内存）...", "warning")
+            save_video(frames, output_video, fps=fps)
         
         # 验证文件
         if os.path.exists(output_video):
