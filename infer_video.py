@@ -25,6 +25,7 @@ import time
 import hashlib
 import json
 import glob
+import gc
 
 # 将项目根目录添加到 sys.path，而不是 src 目录
 _project_root = os.path.dirname(os.path.abspath(__file__))
@@ -2274,7 +2275,8 @@ def _worker_process(worker_id: int, device: str, segment_file: str,
         
         # 初始化pipeline
         report_progress("LOAD", "Initializing pipeline...")
-        model_path = args.model_dir
+        # 根据 model_ver 参数构建模型路径
+        model_path = f"/app/models/v{args.model_ver}"
         
         # 验证模型路径和文件
         if not os.path.exists(model_path):
@@ -2298,6 +2300,17 @@ def _worker_process(worker_id: int, device: str, segment_file: str,
         missing_files = [f for f in required_files if not os.path.exists(f)]
         if missing_files:
             raise RuntimeError(f"[Worker {worker_id}] Missing required model files:\n  " + "\n  ".join(missing_files))
+        
+        # 验证文件大小和可读性
+        for file_path in required_files:
+            if os.path.exists(file_path):
+                file_size = os.path.getsize(file_path)
+                if file_size == 0:
+                    raise RuntimeError(f"[Worker {worker_id}] Model file is empty: {file_path}")
+                # 检查文件是否可读
+                if not os.access(file_path, os.R_OK):
+                    raise RuntimeError(f"[Worker {worker_id}] Model file is not readable: {file_path}")
+                report_progress("LOAD", f"  {os.path.basename(file_path)}: {file_size / (1024**2):.2f} MB")
         
         report_progress("LOAD", f"Model directory: {model_path} (verified)")
         
@@ -3852,7 +3865,9 @@ def main(args):
     }
     dtype = dtype_map.get(args.precision, torch.bfloat16)
     
-    pipe = init_pipeline(args.mode, _device, dtype, args.model_dir)
+    # 根据 model_ver 参数构建模型路径
+    model_dir = f"/app/models/v{args.model_ver}"
+    pipe = init_pipeline(args.mode, _device, dtype, model_dir)
     frames, input_fps = read_video_to_tensor(args.input)
     
     # 检查是否需要流式处理（用户控制，类似 --multi_gpu）
@@ -3988,7 +4003,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FlashVSR Standalone Inference with Optimizations")
     parser.add_argument("--input", type=str, required=True, help="Input video path")
     parser.add_argument("--output", type=str, default=None, help="Output video path")
-    parser.add_argument("--model_dir", type=str, default="/app/models", help="Model directory")
+    parser.add_argument("--model_ver", type=str, default="1.1", choices=["1.0", "1.1"], help="Model version (1.0 or 1.1, default: 1.1)")
     parser.add_argument("--mode", type=str, default="tiny", choices=["tiny", "full", "tiny-long"], help="Model mode")
     parser.add_argument("--device", type=str, default="cuda:0", choices=get_device_list(), help="Device (ignored if --multi_gpu is used)")
     

@@ -31,9 +31,9 @@ echo ""
 echo "2. 检查是否使用宿主机已clone的仓库..."
 # 检查多个可能的路径（容器内映射路径）
 POSSIBLE_PATHS=(
+    "/app/Block-Sparse-Attention"
     "/workspace/ycl/flashvsr/Block-Sparse-Attention"
     "/home/dellhpc/workspace/ycl/flashvsr/Block-Sparse-Attention"
-    "$HOST_REPO_PATH"
 )
 
 FOUND_REPO=""
@@ -117,8 +117,8 @@ echo ""
 echo "9. 开始编译安装（支持的架构: $ARCH_LIST）..."
 # 设置环境变量以确保编译时包含所有支持的架构
 export TORCH_CUDA_ARCH_LIST="$ARCH_LIST"
-# 使用 pip 安装（会自动编译）
-pip install -v --no-build-isolation .
+# 使用 pip 安装（会自动编译，强制本地编译避免网络问题）
+pip install --no-binary :all: -v --no-build-isolation .
 
 # 或者使用 setup.py（如果 pip 安装失败）
 # python setup.py install

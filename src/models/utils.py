@@ -77,13 +77,51 @@ def load_state_dict(file_path, torch_dtype=None):
 
 
 def load_state_dict_from_safetensors(file_path, torch_dtype=None):
-    state_dict = {}
-    with safe_open(file_path, framework="pt", device="cpu") as f:
-        for k in f.keys():
-            state_dict[k] = f.get_tensor(k)
-            if torch_dtype is not None:
-                state_dict[k] = state_dict[k].to(torch_dtype)
-    return state_dict
+    """Load state dict from safetensors file with enhanced error handling."""
+    import os
+    
+    # 验证文件存在
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Model file not found: {file_path}")
+    
+    # 检查文件大小（空文件或损坏的文件）
+    file_size = os.path.getsize(file_path)
+    if file_size == 0:
+        raise ValueError(f"Model file is empty: {file_path}")
+    if file_size < 1024:  # 小于1KB可能是损坏的文件
+        raise ValueError(f"Model file is too small (may be corrupted): {file_path} (size: {file_size} bytes)")
+    
+    # 尝试读取文件头，验证是否为有效的 safetensors 文件
+    try:
+        with open(file_path, 'rb') as f:
+            header = f.read(8)
+            # safetensors 文件应该以特定的魔数开头
+            if len(header) < 8:
+                raise ValueError(f"File too short to be a valid safetensors file: {file_path}")
+    except Exception as e:
+        raise IOError(f"Cannot read model file: {file_path}. Error: {e}")
+    
+    # 加载 safetensors
+    try:
+        state_dict = {}
+        with safe_open(file_path, framework="pt", device="cpu") as f:
+            for k in f.keys():
+                state_dict[k] = f.get_tensor(k)
+                if torch_dtype is not None:
+                    state_dict[k] = state_dict[k].to(torch_dtype)
+        return state_dict
+    except Exception as e:
+        # 提供更详细的错误信息
+        error_msg = f"Failed to load safetensors file: {file_path}\n"
+        error_msg += f"  File size: {file_size / (1024**2):.2f} MB\n"
+        error_msg += f"  Error type: {type(e).__name__}\n"
+        error_msg += f"  Error message: {str(e)}\n"
+        error_msg += f"\nPossible causes:\n"
+        error_msg += f"  1. File is corrupted or incomplete\n"
+        error_msg += f"  2. File is not a valid safetensors file\n"
+        error_msg += f"  3. safetensors library version incompatibility\n"
+        error_msg += f"  4. File path is incorrect (check if file exists and is readable)\n"
+        raise RuntimeError(error_msg) from e
 
 
 def load_state_dict_from_bin(file_path, torch_dtype=None):
