@@ -196,14 +196,43 @@ def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: 
     return cropped.squeeze(0)
 
 def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16):
-    """Prepare video tensor by upscaling and padding."""
+    """Prepare video tensor by upscaling and padding.
+    
+    返回: (vid_final, tH, tW, F_, N0)
+    - F_: 算法处理后的帧数（可能包含补帧）
+    - N0: 原始输入帧数（用于后续裁剪，确保输出帧数 = 输入帧数）
+    
+    关键修改：确保 F_ 足够大，使得 pipe 能够生成至少 N0 帧的输出。
+    pipe 内部使用 process_total_num = (num_frames - 1) // 8 - 2 计算处理次数，
+    实际输出帧数可能少于输入的 num_frames（根据观察，F=49 时输出约 45 帧，少约 4 帧）。
+    为了确保 pipe 能生成至少 N0 帧，我们需要增加 F_ 的值。
+    """
     N0, h0, w0, _ = image_tensor.shape
     multiple = 128
     sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
+    
+    # 初始计算：N0 + 4 然后取 largest_8n1_leq
     num_frames_with_padding = N0 + 4
-    F_ = largest_8n1_leq(num_frames_with_padding)
-    if F_ == 0:
+    F_min = largest_8n1_leq(num_frames_with_padding)
+    if F_min == 0:
         raise RuntimeError(f"Not enough frames after padding: {num_frames_with_padding}")
+    
+    # 关键修改：pipe 的输出帧数可能少于输入的 num_frames
+    # 根据观察和经验，pipe 的输出帧数大约比输入少 4-8 帧（取决于 F 的大小）
+    # 为了确保 pipe 能生成至少 N0 帧，我们需要增加 F_
+    # 策略：增加额外的安全余量（至少 8 帧，因为 largest_8n1_leq 要求 8n+1）
+    # 如果 F_min 已经足够大（> N0 + 8），可能不需要增加；否则增加
+    safety_margin = 8  # 安全余量：至少增加 8 帧
+    if F_min < N0 + safety_margin:
+        # 增加安全余量，确保 pipe 输出足够
+        # 计算需要的最小 F：N0 + safety_margin，然后取 largest_8n1_leq
+        target_frames = N0 + safety_margin + 4  # +4 是原有的 padding
+        F_ = largest_8n1_leq(target_frames)
+        # 如果还是不够，继续增加
+        if F_ <= F_min:
+            F_ = largest_8n1_leq(target_frames + 8)
+    else:
+        F_ = F_min
 
     frames = []
     for i in range(F_):
@@ -220,7 +249,7 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
     del vid_stacked
     clean_vram()
     
-    return vid_final, tH, tW, F_
+    return vid_final, tH, tW, F_, N0  # 返回原始输入帧数 N0
 
 def get_gpu_memory_info(device: str) -> Tuple[float, float]:
     """Get GPU memory info (used, total) in GB."""
@@ -1120,16 +1149,19 @@ def run_single_gpu_inference(args, total_frames: int, input_fps: float, device_i
 # ==============================================================
 
 def process_tile_batch_distributed(pipe, frames, device, dtype, args, tile_batch: List[Tuple[int, int, int, int]], batch_idx: int, rank: int):
-    """处理一批tiles（从原版复制并适配分布式）。"""
+    """处理一批tiles（从原版复制并适配分布式）。
+    
+    关键修改：只保留原始输入帧对应的输出，删除所有补帧。
+    """
     N, H, W, C = frames.shape
-    num_aligned_frames = largest_8n1_leq(N + 4) - 4
 
     results = []
     
     for tile_idx, (x1, y1, x2, y2) in enumerate(tile_batch):
         input_tile = frames[:, y1:y2, x1:x2, :]
+        N_tile = input_tile.shape[0]  # 原始输入帧数
 
-        LQ_tile, th, tw, F = prepare_input_tensor(input_tile, device, scale=args.scale, dtype=dtype)
+        LQ_tile, th, tw, F, N0_tile = prepare_input_tensor(input_tile, device, scale=args.scale, dtype=dtype)
         if "long" not in args.mode:
             LQ_tile = LQ_tile.to(device)
 
@@ -1138,8 +1170,8 @@ def process_tile_batch_distributed(pipe, frames, device, dtype, args, tile_batch
         # 验证参数：确保 num_frames 足够大
         if F < 17:  # FlashVSR 需要至少 17 帧才能正常工作（这是处理后的帧数）
             log(f"[Rank {rank}] WARNING: Tile has only {F} frames, minimum is 17. Skipping this tile.", "warning", rank)
-            # 返回一个占位结果（用最后一帧填充）
-            placeholder = frames[-1:, y1:y2, x1:x2, :].repeat(F * args.scale, 1, 1, 1)
+            # 返回一个占位结果（使用原始输入帧数）
+            placeholder = frames[-1:, y1:y2, x1:x2, :].repeat(N0_tile, 1, 1, 1)  # 使用原始输入帧数
             return [{
                 'coords': (x1, y1, x2, y2),
                 'tile': placeholder,
@@ -1175,8 +1207,38 @@ def process_tile_batch_distributed(pipe, frames, device, dtype, args, tile_batch
                 else:
                     raise
 
+        # 检查pipe返回的格式
+        if isinstance(output_tile, (tuple, list)):
+            output_tile = output_tile[0]
+            log(f"[Rank {rank}] Tile ({x1},{y1})-({x2},{y2}): pipe returned tuple/list, using first element", "info", rank)
+        
+        log(f"[Rank {rank}] Tile ({x1},{y1})-({x2},{y2}): pipe output_tile shape before tensor2video: {output_tile.shape if hasattr(output_tile, 'shape') else type(output_tile)}", "info", rank)
+        
         processed_tile_cpu = tensor2video(output_tile).to("cpu")
-
+        
+        # 添加详细日志
+        log(f"[Rank {rank}] Tile ({x1},{y1})-({x2},{y2}): after tensor2video: {processed_tile_cpu.shape[0]} frames, expected F={F}, N0_tile={N0_tile}, N_tile={N_tile}", "info", rank)
+        
+        # 关键修改：确保输出帧数 = 原始输入帧数 N0_tile（一一对应）
+        # 如果 pipe 返回的帧数少于 N0_tile，说明 prepare_input_tensor 中的 F_ 不够大
+        # 这种情况下，原始输入的某些帧会丢失，无法保证一一对应
+        # 我们应该报错，提示需要增加 F_ 的值
+        if processed_tile_cpu.shape[0] < N0_tile:
+            # 这是严重错误：pipe 返回的帧数少于原始输入，会导致原始帧丢失
+            raise RuntimeError(
+                f"[Rank {rank}] ERROR: Pipeline returned only {processed_tile_cpu.shape[0]} frames, "
+                f"but need {N0_tile} frames (original input frames). "
+                f"This means {N0_tile - processed_tile_cpu.shape[0]} original input frames will be LOST, "
+                f"breaking the 1-to-1 frame correspondence requirement. "
+                f"F={F} (input to pipe) is too small. Need to increase F in prepare_input_tensor. "
+                f"Current: F={F}, N0_tile={N0_tile}, pipe_output={processed_tile_cpu.shape[0]}"
+            )
+        elif processed_tile_cpu.shape[0] > N0_tile:
+            # 如果pipe返回的帧数多于N0_tile，删除补帧（只保留前N0_tile帧，对应原始输入）
+            log(f"[Rank {rank}] Removing {processed_tile_cpu.shape[0] - N0_tile} padded frames from tile output (keeping only {N0_tile} original frames)", "info", rank)
+            processed_tile_cpu = processed_tile_cpu[:N0_tile]
+        # 如果正好等于N0_tile，不需要处理
+        
         mask_nchw = create_feather_mask(
             (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
             args.tile_overlap * args.scale,
@@ -1203,13 +1265,15 @@ def run_inference_distributed_segment(pipe, frames, device, dtype, args, rank: i
     3. 支持断点续跑：可以从中断点恢复
     """
     N, H, W, C = frames.shape
-    num_aligned_frames = largest_8n1_leq(N + 4) - 4
+    # 关键修改：使用原始输入帧数 N 作为 canvas 大小，而不是 num_aligned_frames
+    # 这样确保输出帧数 = 输入帧数，一一对应
     out_H, out_W = H * args.scale, W * args.scale
     
     # 计算tile坐标
     tile_coords = calculate_tile_coords(H, W, args.tile_size, args.tile_overlap)
     log(f"[Rank {rank}] Input resolution: {H}x{W}, Tile size: {args.tile_size}, Overlap: {args.tile_overlap}", "info", rank)
     log(f"[Rank {rank}] Calculated {len(tile_coords)} tiles to process", "info", rank)
+    log(f"[Rank {rank}] Using original input frame count {N} for canvas (ensuring 1-to-1 frame correspondence)", "info", rank)
     
     # 检查断点续跑：读取已处理的 tile 列表
     processed_tiles_file = os.path.join(checkpoint_dir, f"rank_{rank}_processed_tiles.json") if checkpoint_dir else None
@@ -1235,20 +1299,33 @@ def run_inference_distributed_segment(pipe, frames, device, dtype, args, rank: i
         canvas_mmap_path = os.path.join(checkpoint_dir, f"rank_{rank}_canvas.npy")
         weight_mmap_path = os.path.join(checkpoint_dir, f"rank_{rank}_weight.npy")
         
-        # 创建或加载内存映射文件
+        # 创建或加载内存映射文件 - 使用原始输入帧数 N
         if os.path.exists(canvas_mmap_path):
             log(f"[Rank {rank}] Loading existing memory-mapped canvas from {canvas_mmap_path}", "info", rank)
-            canvas_mmap = np.memmap(canvas_mmap_path, dtype=np.float16, mode='r+', 
-                                    shape=(num_aligned_frames, out_H, out_W, C))
-            weight_mmap = np.memmap(weight_mmap_path, dtype=np.float16, mode='r+',
-                                    shape=(num_aligned_frames, out_H, out_W, C))
+            # 检查现有文件大小是否匹配
+            existing_mmap = np.memmap(canvas_mmap_path, dtype=np.float16, mode='r')
+            if existing_mmap.shape[0] != N:
+                log(f"[Rank {rank}] WARNING: Existing canvas has {existing_mmap.shape[0]} frames, expected {N}. Recreating...", "warning", rank)
+                os.remove(canvas_mmap_path)
+                os.remove(weight_mmap_path)
+                canvas_mmap = np.memmap(canvas_mmap_path, dtype=np.float16, mode='w+',
+                                        shape=(N, out_H, out_W, C))
+                weight_mmap = np.memmap(weight_mmap_path, dtype=np.float16, mode='w+',
+                                        shape=(N, out_H, out_W, C))
+                canvas_mmap[:] = 0
+                weight_mmap[:] = 0
+            else:
+                canvas_mmap = np.memmap(canvas_mmap_path, dtype=np.float16, mode='r+', 
+                                        shape=(N, out_H, out_W, C))
+                weight_mmap = np.memmap(weight_mmap_path, dtype=np.float16, mode='r+',
+                                        shape=(N, out_H, out_W, C))
         else:
-            log(f"[Rank {rank}] Creating memory-mapped canvas: {canvas_mmap_path} (shape: {num_aligned_frames}x{out_H}x{out_W}x{C})", "info", rank)
-            # 创建内存映射文件
+            log(f"[Rank {rank}] Creating memory-mapped canvas: {canvas_mmap_path} (shape: {N}x{out_H}x{out_W}x{C})", "info", rank)
+            # 创建内存映射文件 - 使用原始输入帧数 N
             canvas_mmap = np.memmap(canvas_mmap_path, dtype=np.float16, mode='w+',
-                                    shape=(num_aligned_frames, out_H, out_W, C))
+                                    shape=(N, out_H, out_W, C))
             weight_mmap = np.memmap(weight_mmap_path, dtype=np.float16, mode='w+',
-                                    shape=(num_aligned_frames, out_H, out_W, C))
+                                    shape=(N, out_H, out_W, C))
             canvas_mmap[:] = 0
             weight_mmap[:] = 0
             # 同步到磁盘
@@ -1259,8 +1336,8 @@ def run_inference_distributed_segment(pipe, frames, device, dtype, args, rank: i
         canvas = torch.from_numpy(canvas_mmap)
         weight_canvas = torch.from_numpy(weight_mmap)
     else:
-        # 回退到内存模式（如果 checkpoint_dir 为 None）
-        canvas = torch.zeros((num_aligned_frames, out_H, out_W, C), dtype=torch.float16, device="cpu")
+        # 回退到内存模式（如果 checkpoint_dir 为 None）- 使用原始输入帧数 N
+        canvas = torch.zeros((N, out_H, out_W, C), dtype=torch.float16, device="cpu")
         weight_canvas = torch.zeros_like(canvas)
     
     # 确定最优批量大小
@@ -1316,6 +1393,14 @@ def run_inference_distributed_segment(pipe, frames, device, dtype, args, rank: i
                             processed_tile_cpu = result['tile']
                             mask_nhwc = result['mask']
                             
+                            # 关键检查：确保processed_tile_cpu的帧数等于canvas的帧数（N）
+                            if processed_tile_cpu.shape[0] != N:
+                                raise RuntimeError(
+                                    f"[Rank {rank}] ERROR: Tile output frames ({processed_tile_cpu.shape[0]}) != canvas frames ({N}). "
+                                    f"This breaks the 1-to-1 frame correspondence requirement. "
+                                    f"Tile coords: ({x1},{y1})-({x2},{y2})"
+                                )
+                            
                             out_x1, out_y1 = x1 * args.scale, y1 * args.scale
                             tile_H_scaled = processed_tile_cpu.shape[1]
                             tile_W_scaled = processed_tile_cpu.shape[2]
@@ -1337,12 +1422,21 @@ def run_inference_distributed_segment(pipe, frames, device, dtype, args, rank: i
             processed_tile_cpu = result['tile']
             mask_nhwc = result['mask']
             
+            # 关键检查：确保processed_tile_cpu的帧数等于canvas的帧数（N）
+            if processed_tile_cpu.shape[0] != N:
+                raise RuntimeError(
+                    f"[Rank {rank}] ERROR: Tile output frames ({processed_tile_cpu.shape[0]}) != canvas frames ({N}). "
+                    f"This breaks the 1-to-1 frame correspondence requirement. "
+                    f"Tile coords: ({x1},{y1})-({x2},{y2})"
+                )
+            
             out_x1, out_y1 = x1 * args.scale, y1 * args.scale
             tile_H_scaled = processed_tile_cpu.shape[1]
             tile_W_scaled = processed_tile_cpu.shape[2]
             out_x2, out_y2 = out_x1 + tile_W_scaled, out_y1 + tile_H_scaled
             
             # 流式写入：立即写入 canvas（内存映射会自动同步到磁盘）
+            # 确保processed_tile_cpu的帧数等于canvas的帧数（N）
             canvas[:, out_y1:out_y2, out_x1:out_x2, :] += processed_tile_cpu * mask_nhwc
             weight_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += mask_nhwc
         
@@ -1410,18 +1504,16 @@ def run_inference_distributed_segment(pipe, frames, device, dtype, args, rank: i
         except:
             pass
     
-    # 裁剪到实际处理的帧数（考虑 prepare_input_tensor 可能减少的帧数）
-    # 注意：prepare_input_tensor 中的 largest_8n1_leq 可能会减少帧数
-    # 例如：22帧 -> 21帧，24帧 -> 21帧，23帧 -> 21帧
-    # 但我们应该保持原始输入帧数 N，因为后续合并时会处理 overlap
-    # 如果 output 的帧数多于 N，说明 prepare_input_tensor 增加了帧数（不应该发生）
-    # 如果 output 的帧数少于 N，说明 prepare_input_tensor 减少了帧数，这是正常的
-    # 我们保持 output 的原始帧数，不进行裁剪，让后续的 overlap 处理来正确合并
-    # 但为了安全，如果 output 帧数明显多于 N，进行裁剪
-    if output.shape[0] > N + 4:  # 允许一些padding，但如果太多则裁剪
-        log(f"[Rank {rank}] WARNING: Output frames ({output.shape[0]}) > input frames ({N}) + padding, cropping to {N}", "warning", rank)
-        output = output[:N]
-    # 否则保持 output 的原始帧数，让后续的 overlap 处理来正确合并
+    # 关键修改：确保输出帧数 = 输入帧数 N（一一对应）
+    if output.shape[0] != N:
+        log(f"[Rank {rank}] WARNING: Output frames ({output.shape[0]}) != input frames ({N}), adjusting to match", "warning", rank)
+        if output.shape[0] > N:
+            output = output[:N]
+        else:
+            # 如果输出帧数少于输入，这是错误，不应该发生
+            raise RuntimeError(f"[Rank {rank}] ERROR: Output frames ({output.shape[0]}) < input frames ({N}). This should not happen with the new logic.")
+    
+    log(f"[Rank {rank}] Final output: {output.shape[0]} frames (1-to-1 with input)", "info", rank)
     
     # 清理内存映射文件（可选：保留用于调试）
     # if use_mmap and canvas_mmap_path and os.path.exists(canvas_mmap_path):
@@ -1584,19 +1676,16 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
                 else:
                     log(f"[Rank {rank}] WARNING: Output frames ({segment_output.shape[0]}) <= overlap ({segment_overlap}), cannot remove back overlap. Keeping all frames.", "warning", rank)
             
-            # 如果输出帧数与期望不一致，进行填充或裁剪
+            # 关键修改：移除补帧逻辑，只进行裁剪
+            # 如果输出帧数 != 期望帧数，记录警告但不补帧
             actual_output_frames = segment_output.shape[0]
-            if actual_output_frames < expected_output_frames:
-                # 如果输出帧数少于期望，使用最后一帧填充
-                missing = expected_output_frames - actual_output_frames
-                log(f"[Rank {rank}] Output frames ({actual_output_frames}) < expected ({expected_output_frames}), padding {missing} frames with last frame", "info", rank)
-                last_frame = segment_output[-1:, :, :, :]
-                padding = last_frame.repeat(missing, 1, 1, 1)
-                segment_output = torch.cat([segment_output, padding], dim=0)
-            elif actual_output_frames > expected_output_frames:
-                # 如果输出帧数多于期望，裁剪到期望帧数
-                log(f"[Rank {rank}] Output frames ({actual_output_frames}) > expected ({expected_output_frames}), cropping to {expected_output_frames} frames", "info", rank)
-                segment_output = segment_output[:expected_output_frames]
+            if actual_output_frames != expected_output_frames:
+                if actual_output_frames < expected_output_frames:
+                    log(f"[Rank {rank}] WARNING: Output frames ({actual_output_frames}) < expected ({expected_output_frames}). Missing {expected_output_frames - actual_output_frames} frames.", "warning", rank)
+                    log(f"[Rank {rank}] NOTE: Not padding frames to maintain 1-to-1 correspondence with input.", "info", rank)
+                elif actual_output_frames > expected_output_frames:
+                    log(f"[Rank {rank}] Output frames ({actual_output_frames}) > expected ({expected_output_frames}), cropping to {expected_output_frames} frames", "info", rank)
+                    segment_output = segment_output[:expected_output_frames]
             
             if original_output_frames != segment_output.shape[0]:
                 log(f"[Rank {rank}] Overlap processing: {original_output_frames} frames -> {segment_output.shape[0]} frames (expected: {expected_output_frames})", "info", rank)
@@ -1796,7 +1885,6 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
                     os.makedirs(output_path, exist_ok=True)
                     
                     total_frames_written = 0
-                    last_frame = None
                     
                     # 流式处理每个 rank 的结果，直接保存为图像序列
                     log(f"[Rank 0] [Streaming] Processing {len(result_files)} rank results and saving as image sequence (CPU memory only)...", "info", rank)
@@ -1828,28 +1916,18 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
                             if frames_in_rank % 50 == 0 or frames_in_rank == segment_np.shape[0]:
                                 log(f"[Rank 0] [Streaming]   - Saved {frames_in_rank}/{segment_np.shape[0]} frames from Rank {r} (total: {total_frames_written} frames)", "info", rank)
                         
-                        # 保存最后一帧（用于可能的填充）
-                        last_frame = segment[-1:, :, :, :]
-                        
                         # 释放内存
                         del segment, segment_np
                         gc.collect()
                         
                         log(f"[Rank 0] [Streaming]   - ✓ Rank {r} completed. Total frames saved: {total_frames_written}", "success", rank)
                     
-                    # 检查是否需要填充
+                    # 关键修改：移除补帧逻辑
+                    # 如果总帧数不足，记录警告但不补帧
                     if total_frames_written < total_frames:
                         missing = total_frames - total_frames_written
-                        log(f"[Rank 0] Padding {missing} frames using the last frame...", "info", rank)
-                        if last_frame is not None:
-                            padding_np = (last_frame.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')[0]  # [H, W, C]
-                            for i in range(missing):
-                                frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.png")
-                                cv2.imwrite(frame_filename, cv2.cvtColor(padding_np, cv2.COLOR_RGB2BGR))
-                                total_frames_written += 1
-                                if (i + 1) % 10 == 0:
-                                    log(f"[Rank 0]   Padded {i + 1}/{missing} frames...", "info", rank)
-                        log(f"[Rank 0] ✓ Padded to {total_frames_written} frames (target: {total_frames})", "info", rank)
+                        log(f"[Rank 0] WARNING: Saved {total_frames_written} frames < target {total_frames}. Missing {missing} frames.", "warning", rank)
+                        log(f"[Rank 0] NOTE: Not padding frames to maintain 1-to-1 correspondence with input.", "info", rank)
                     elif total_frames_written > total_frames:
                         log(f"[Rank 0] WARNING: Saved {total_frames_written} frames > target {total_frames}. May have extra frames.", "warning", rank)
                     
@@ -1869,7 +1947,6 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
                         log(f"[Rank 0] Temporary file: {tmp_yuv_path}", "info", rank)
                         
                         total_frames_written = 0
-                        last_frame = None
                         
                         # 流式处理每个 rank 的结果，写入临时文件
                         log(f"[Rank 0] [Streaming] Processing {len(result_files)} rank results and writing to temp file (CPU memory only)...", "info", rank)
@@ -1901,27 +1978,18 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
                                 if frames_in_rank % 100 == 0 or frames_in_rank == segment_np.shape[0]:
                                     log(f"[Rank 0] [Streaming]   - Written {frames_in_rank}/{segment_np.shape[0]} frames from Rank {r} to temp file (total: {total_frames_written} frames)", "info", rank)
                             
-                            # 保存最后一帧（用于可能的填充）
-                            last_frame = segment[-1:, :, :, :]
-                            
                             # 释放内存
                             del segment, segment_np
                             gc.collect()
                             
                             log(f"[Rank 0] [Streaming]   - ✓ Rank {r} completed. Total frames in temp file: {total_frames_written}", "success", rank)
                     
-                        # 检查是否需要填充
+                        # 关键修改：移除补帧逻辑
+                        # 如果总帧数不足，记录警告但不补帧
                         if total_frames_written < total_frames:
                             missing = total_frames - total_frames_written
-                            log(f"[Rank 0] Padding {missing} frames using the last frame...", "info", rank)
-                            if last_frame is not None:
-                                padding_np = (last_frame.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
-                                for i in range(missing):
-                                    tmp_yuv.write(padding_np[0].tobytes())
-                                    total_frames_written += 1
-                                    if (i + 1) % 10 == 0:
-                                        log(f"[Rank 0]   Padded {i + 1}/{missing} frames...", "info", rank)
-                            log(f"[Rank 0] ✓ Padded to {total_frames_written} frames (target: {total_frames})", "info", rank)
+                            log(f"[Rank 0] WARNING: Written {total_frames_written} frames < target {total_frames}. Missing {missing} frames.", "warning", rank)
+                            log(f"[Rank 0] NOTE: Not padding frames to maintain 1-to-1 correspondence with input.", "info", rank)
                         elif total_frames_written > total_frames:
                             log(f"[Rank 0] WARNING: Written {total_frames_written} frames > target {total_frames}. Video may have extra frames.", "warning", rank)
                         
@@ -2007,13 +2075,14 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
                 results.sort(key=lambda x: x[0])
                 merged = torch.cat([r[1] for r in results], dim=0)
                 
+                # 关键修改：移除补帧逻辑，只进行裁剪
                 if merged.shape[0] != total_frames:
                     if merged.shape[0] < total_frames:
-                        missing = total_frames - merged.shape[0]
-                        last_frame = merged[-1:, :, :, :]
-                        padding = last_frame.repeat(missing, 1, 1, 1)
-                        merged = torch.cat([merged, padding], dim=0)
+                        log(f"[Rank 0] WARNING: Merged frames ({merged.shape[0]}) < total frames ({total_frames}). Missing {total_frames - merged.shape[0]} frames.", "warning", rank)
+                        log(f"[Rank 0] NOTE: Not padding frames to maintain 1-to-1 correspondence with input.", "info", rank)
+                        # 不补帧，直接使用实际帧数
                     else:
+                        log(f"[Rank 0] Merged frames ({merged.shape[0]}) > total frames ({total_frames}), cropping to {total_frames} frames", "info", rank)
                         merged = merged[:total_frames]
                 
                 save_video(merged, output_path, input_fps)
