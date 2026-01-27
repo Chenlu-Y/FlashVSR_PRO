@@ -31,6 +31,7 @@ if _project_root not in sys.path:
 
 import torch
 import cv2
+import numpy as np
 from typing import List, Tuple, Optional
 import hashlib
 import tempfile
@@ -244,6 +245,7 @@ def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: floa
             
             total_frames_written = 0
             last_frame = None
+            global_hdr_max_all = None  # 用于存储所有rank的全局HDR最大值
             if output_format == "dpx10":
                 from utils.io.video_io import save_frame_as_dpx10
             
@@ -263,11 +265,69 @@ def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: floa
                 
                 if output_format == "dpx10":
                     log(f"[Merge]     - Saving as 10-bit DPX...", "info")
+                    # 检查是否是HDR（值可能>1.0）
+                    is_hdr = (segment > 1.0).any().item()
+                    global_hdr_max = None
+                    
+                    if is_hdr:
+                        log(f"[Merge]     - 检测到 HDR 值，范围: [{segment.min():.4f}, {segment.max():.4f}]", "info")
+                        # 尝试从tone mapping参数文件中读取全局HDR最大值
+                        params_file = os.path.join(checkpoint_dir, f"rank_{r}_tone_mapping_params.json")
+                        if os.path.exists(params_file):
+                            try:
+                                with open(params_file, 'r') as f:
+                                    params_list = json.load(f)
+                                    # 从所有帧的参数中提取最大HDR值
+                                    max_hdr_values = []
+                                    for params in params_list:
+                                        if 'max_hdr' in params:
+                                            max_hdr_values.append(params['max_hdr'])
+                                    if max_hdr_values:
+                                        global_hdr_max = max(max_hdr_values)
+                                        log(f"[Merge]     - 从参数文件读取全局 HDR 最大值: {global_hdr_max:.4f}", "info")
+                            except Exception as e:
+                                log(f"[Merge]     - 警告: 无法读取参数文件: {e}，使用帧内最大值", "warning")
+                        
+                        # 如果没有从参数文件读取到，使用所有rank的最大值
+                        if global_hdr_max is None:
+                            global_hdr_max = segment.max().item()
+                            # 尝试从其他rank的参数文件中查找更大的值
+                            for other_rank in range(world_size):
+                                if other_rank == r:
+                                    continue
+                                other_params_file = os.path.join(checkpoint_dir, f"rank_{other_rank}_tone_mapping_params.json")
+                                if os.path.exists(other_params_file):
+                                    try:
+                                        with open(other_params_file, 'r') as f:
+                                            other_params_list = json.load(f)
+                                            for params in other_params_list:
+                                                if 'max_hdr' in params:
+                                                    global_hdr_max = max(global_hdr_max, params['max_hdr'])
+                                    except:
+                                        pass
+                            log(f"[Merge]     - 使用全局 HDR 最大值: {global_hdr_max:.4f}（保留绝对亮度关系）", "info")
+                            # 更新全局最大值（用于填充帧）
+                            if global_hdr_max_all is None or global_hdr_max > global_hdr_max_all:
+                                global_hdr_max_all = global_hdr_max
+                    else:
+                        log(f"[Merge]     - SDR 模式（所有值 <= 1.0）", "info")
+                    
+                    # 恢复工具默认保存为线性 RGB（HDR格式），因为通常用于生成 HDR 视频
+                    # 如果需要 sRGB 格式，可以在恢复后使用转换工具
+                    apply_srgb_gamma = False  # 恢复工具默认保存线性 RGB（HDR）
+                    if apply_srgb_gamma:
+                        log(f"[Merge] [HDR] 保存为 sRGB DPX（SDR格式）", "info")
+                    else:
+                        log(f"[Merge] [HDR] 保存为线性 RGB DPX（HDR格式），可用于生成 HDR 视频", "info")
+                    
                     frames_in_rank = 0
                     for frame_idx in range(segment.shape[0]):
-                        frame = segment[frame_idx].clamp(0, 1).cpu().numpy()
+                        frame = segment[frame_idx].cpu().numpy()  # 不clamp，保留HDR值
+                        # 对于SDR，确保在[0,1]范围内
+                        if not is_hdr:
+                            frame = np.clip(frame, 0, 1)
                         frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.dpx")
-                        save_frame_as_dpx10(frame, frame_filename)
+                        save_frame_as_dpx10(frame, frame_filename, hdr_max=global_hdr_max, apply_srgb_gamma=apply_srgb_gamma)
                         frames_in_rank += 1
                         total_frames_written += 1
                         if frames_in_rank % 50 == 0 or frames_in_rank == segment.shape[0]:
@@ -299,10 +359,15 @@ def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: floa
                 log(f"[Merge] Padding {missing} frames using the last frame...", "info")
                 if last_frame is not None:
                     if output_format == "dpx10":
-                        pad_np = last_frame.clamp(0, 1).cpu().numpy()[0]
+                        pad_np = last_frame.cpu().numpy()[0]  # 不clamp，保留HDR值
+                        # 对于SDR，确保在[0,1]范围内
+                        if global_hdr_max_all is None:
+                            pad_np = np.clip(pad_np, 0, 1)
+                        # 恢复工具默认保存为线性 RGB（HDR格式）
+                        apply_srgb_gamma = False
                         for i in range(missing):
                             frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.dpx")
-                            save_frame_as_dpx10(pad_np, frame_filename)
+                            save_frame_as_dpx10(pad_np, frame_filename, hdr_max=global_hdr_max_all, apply_srgb_gamma=apply_srgb_gamma)
                             total_frames_written += 1
                             if (i + 1) % 10 == 0:
                                 log(f"[Merge]   Padded {i + 1}/{missing} frames...", "info")

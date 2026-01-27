@@ -1282,11 +1282,24 @@ def run_single_gpu_inference(args, total_frames: int, input_fps: float, device_i
         if detect_hdr_range(segment_frames):
             log(f"[Single-GPU] [HDR] 检测到 HDR 输入，应用 Tone Mapping ({args.tone_mapping_method})...", "info")
             log(f"[Single-GPU] [HDR] 原始范围: [{segment_frames.min():.4f}, {segment_frames.max():.4f}]", "info")
+            
+            # 默认使用全局参数（避免帧间频闪），除非用户明确指定 --per_frame_tone_mapping
+            use_per_frame = getattr(args, 'per_frame_tone_mapping', False)
+            global_l_max = getattr(args, 'global_l_max', None)
+            
+            # 默认使用全局参数
+            if not use_per_frame and global_l_max is None:
+                global_l_max = segment_frames.max().item() * args.tone_mapping_exposure
+                log(f"[Single-GPU] [HDR] 使用全局 Tone Mapping（l_max: {global_l_max:.4f}，避免频闪）", "info")
+            elif use_per_frame:
+                log(f"[Single-GPU] [HDR] 使用每帧独立 Tone Mapping（警告：可能导致频闪）", "warning")
+            
             segment_frames, tone_mapping_params = apply_tone_mapping_to_frames(
                 segment_frames,
                 method=args.tone_mapping_method,
                 exposure=args.tone_mapping_exposure,
-                per_frame=True
+                per_frame=use_per_frame,  # 默认 False（使用全局参数）
+                global_l_max=global_l_max
             )
             log(f"[Single-GPU] [HDR] Tone Mapping 完成，SDR 范围: [{segment_frames.min():.4f}, {segment_frames.max():.4f}]", "info")
             
@@ -1371,11 +1384,18 @@ def run_single_gpu_inference(args, total_frames: int, input_fps: float, device_i
             else:
                 global_hdr_max = None
             
+            # 检查是否保存为线性 RGB（HDR格式）
+            apply_srgb_gamma = not getattr(args, 'dpx_linear_rgb', False)
+            if not apply_srgb_gamma:
+                log(f"[Single-GPU] [HDR] 保存为线性 RGB DPX（HDR格式），不应用 sRGB 伽马校正", "info")
+            else:
+                log(f"[Single-GPU] [HDR] 保存为 sRGB DPX（SDR格式），应用 sRGB 伽马校正", "info")
+            
             for frame_idx in range(output.shape[0]):
                 frame = output[frame_idx].cpu().numpy()  # (H,W,3) float，可能是 HDR
                 # 使用全局 HDR 最大值归一化（保留绝对亮度关系）
                 frame_filename = os.path.join(output_path, f"frame_{frame_idx:06d}.dpx")
-                save_frame_as_dpx10(frame, frame_filename, hdr_max=global_hdr_max)
+                save_frame_as_dpx10(frame, frame_filename, hdr_max=global_hdr_max, apply_srgb_gamma=apply_srgb_gamma)
             log(f"[Single-GPU] ✓ Saved {output.shape[0]} frames as 10-bit DPX to {output_path}", "finish")
         else:
             # PNG 输出：如果启用了 hdr_mode 且包含 HDR 值，需要 clip（PNG 不支持 HDR）
@@ -1879,11 +1899,25 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
             if detect_hdr_range(segment_frames):
                 log(f"[Rank {rank}] [HDR] 检测到 HDR 输入，应用 Tone Mapping ({args.tone_mapping_method})...", "info", rank)
                 log(f"[Rank {rank}] [HDR] 原始范围: [{segment_frames.min():.4f}, {segment_frames.max():.4f}]", "info", rank)
+                
+                # 默认使用全局参数（避免帧间频闪），除非用户明确指定 --per_frame_tone_mapping
+                use_per_frame = getattr(args, 'per_frame_tone_mapping', False)
+                global_l_max = getattr(args, 'global_l_max', None)
+                
+                # 默认使用全局参数（当前 segment 的最大值作为 l_max）
+                # 注意：分布式环境中每个 rank 使用自己 segment 的最大值，这是可接受的折中
+                if not use_per_frame and global_l_max is None:
+                    global_l_max = segment_frames.max().item() * args.tone_mapping_exposure
+                    log(f"[Rank {rank}] [HDR] 使用全局 Tone Mapping（segment l_max: {global_l_max:.4f}，避免频闪）", "info", rank)
+                elif use_per_frame:
+                    log(f"[Rank {rank}] [HDR] 使用每帧独立 Tone Mapping（警告：可能导致频闪）", "warning", rank)
+                
                 segment_frames, tone_mapping_params = apply_tone_mapping_to_frames(
                     segment_frames,
                     method=args.tone_mapping_method,
                     exposure=args.tone_mapping_exposure,
-                    per_frame=True
+                    per_frame=use_per_frame,  # 默认 False（使用全局参数）
+                    global_l_max=global_l_max
                 )
                 log(f"[Rank {rank}] [HDR] Tone Mapping 完成，SDR 范围: [{segment_frames.min():.4f}, {segment_frames.max():.4f}]", "info", rank)
                 
@@ -2215,6 +2249,13 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
                             else:
                                 global_hdr_max = None
                             
+                            # 检查是否保存为线性 RGB（HDR格式）
+                            apply_srgb_gamma = not getattr(args, 'dpx_linear_rgb', False)
+                            if not apply_srgb_gamma:
+                                log(f"[Rank 0] [Streaming] [HDR] 保存为线性 RGB DPX（HDR格式），不应用 sRGB 伽马校正", "info", rank)
+                            else:
+                                log(f"[Rank 0] [Streaming] [HDR] 保存为 sRGB DPX（SDR格式），应用 sRGB 伽马校正", "info", rank)
+                            
                             frames_in_rank = 0
                             for frame_idx in range(segment.shape[0]):
                                 frame = segment[frame_idx].cpu().numpy()  # (H,W,3) float，可能是 HDR
@@ -2223,7 +2264,7 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
                                     frame = np.clip(frame, 0, 1)
                                 frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.dpx")
                                 # 使用全局 HDR 最大值归一化（保留绝对亮度关系）
-                                save_frame_as_dpx10(frame, frame_filename, hdr_max=global_hdr_max)
+                                save_frame_as_dpx10(frame, frame_filename, hdr_max=global_hdr_max, apply_srgb_gamma=apply_srgb_gamma)
                                 frames_in_rank += 1
                                 total_frames_written += 1
                                 if frames_in_rank % 50 == 0 or frames_in_rank == segment.shape[0]:
@@ -2679,6 +2720,9 @@ if __name__ == "__main__":
                        help="Output mode: 'video' for video file (default), 'pictures' for image sequence")
     parser.add_argument("--output_format", type=str, default="png", choices=["png", "dpx10"],
                        help="When output_mode=pictures: 'png' (8-bit, default) or 'dpx10' (10-bit DPX). Ignored when output_mode=video.")
+    parser.add_argument("--dpx_linear_rgb", action="store_true",
+                       help="保存 DPX 为线性 RGB（HDR格式）。默认应用 sRGB 伽马校正（SDR格式）。"
+                            "如果启用，DPX 文件将保持线性 RGB，可用于生成 HDR 视频，但在标准显示器上查看时会显示为灰色。")
     parser.add_argument("--hdr_mode", action="store_true",
                        help="启用 HDR 模式：自动检测 HDR 输入，应用 Tone Mapping 压缩高光，超分后还原")
     parser.add_argument("--tone_mapping_method", type=str, default="logarithmic",
@@ -2686,6 +2730,12 @@ if __name__ == "__main__":
                        help="Tone Mapping 方法（默认: logarithmic，完全可逆）")
     parser.add_argument("--tone_mapping_exposure", type=float, default=1.0,
                        help="Tone Mapping 曝光调整（默认: 1.0）")
+    parser.add_argument("--per_frame_tone_mapping", action="store_true",
+                       help="使用每帧独立的 Tone Mapping 参数（不推荐，可能导致频闪）。"
+                            "默认使用全局参数，确保帧间一致性。")
+    parser.add_argument("--global_l_max", type=float, default=None,
+                       help="手动指定全局 l_max（如果已知原始视频的最大亮度值）。"
+                            "如果不指定，将自动计算。")
     parser.add_argument("--fps", type=float, default=30.0,
                        help="Frames per second (used when input is image sequence, default: 30.0)")
     parser.add_argument("--model_ver", type=str, default="1.1", choices=["1.0", "1.1"], help="Model version")

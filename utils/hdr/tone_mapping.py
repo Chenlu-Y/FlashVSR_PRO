@@ -129,14 +129,21 @@ def logarithmic_tone_map(hdr: torch.Tensor, exposure: float = 1.0) -> Tuple[torc
 
 
 def logarithmic_inverse_tone_map(sdr: torch.Tensor, params: dict) -> torch.Tensor:
-    """对数 Inverse Tone Mapping: SDR → HDR"""
+    """对数 Inverse Tone Mapping: SDR → HDR
+    
+    改进：
+    1. 使用 global_l_max 或 l_max 进行逆映射（优先使用 global_l_max）
+    2. 移除过度的 clamp 限制，允许超分模型可能产生的更高值
+    3. 使用 global_max_hdr 作为参考上限（而非硬性限制）
+    """
     method = params.get('method', 'logarithmic')
     if method != 'logarithmic':
         raise ValueError(f"参数方法 {method} 与 logarithmic_inverse_tone_map 不匹配")
     
     exposure = params.get('exposure', 1.0)
-    l_max = params.get('l_max', 1.0)
-    max_hdr = params.get('max_hdr', 1.0)
+    # 优先使用 global_l_max（全局参数），确保帧间一致性
+    l_max = params.get('global_l_max', params.get('l_max', 1.0))
+    max_hdr = params.get('global_max_hdr', params.get('max_hdr', 1.0))
     
     if l_max <= 0:
         return torch.zeros_like(sdr)
@@ -147,8 +154,10 @@ def logarithmic_inverse_tone_map(sdr: torch.Tensor, params: dict) -> torch.Tenso
     # 反曝光
     hdr = ldr / exposure
     
-    # 限制到原始最大值
-    hdr = torch.clamp(hdr, 0.0, max_hdr * 1.1)
+    # 改进：使用更宽松的上限（允许超分模型可能产生的更高值）
+    # 不再硬性 clamp 到 max_hdr * 1.1，而是使用更大的余量
+    # 只限制极端值（避免 inf/nan）
+    hdr = torch.clamp(hdr, 0.0, max_hdr * 2.0)  # 允许 100% 的余量
     
     return hdr
 
@@ -267,7 +276,8 @@ def apply_tone_mapping_to_frames(
     frames: torch.Tensor,
     method: Literal['reinhard', 'logarithmic', 'aces'] = 'reinhard',
     exposure: float = 1.0,
-    per_frame: bool = True
+    per_frame: bool = True,
+    global_l_max: Optional[float] = None
 ) -> Tuple[torch.Tensor, list]:
     """对帧序列应用 Tone Mapping
     
@@ -276,6 +286,9 @@ def apply_tone_mapping_to_frames(
         method: tone mapping 方法
         exposure: 曝光调整
         per_frame: 如果 True，每帧独立计算参数；如果 False，使用全局参数
+                   注意：per_frame=True 可能导致帧间亮度不一致（频闪），建议设为 False
+        global_l_max: 全局最大值（如果提供，将覆盖自动计算的值）
+                      强烈建议提供此参数以确保帧间一致性
     
     Returns:
         (sdr_frames, params_list): SDR 帧和参数列表
@@ -284,25 +297,76 @@ def apply_tone_mapping_to_frames(
     sdr_frames = []
     params_list = []
     
-    if per_frame:
-        # 每帧独立处理
+    # 计算全局最大值（用于全局模式或作为参考）
+    if global_l_max is None:
+        global_max = frames.max().item()
+    else:
+        global_max = global_l_max
+    
+    if per_frame and global_l_max is None:
+        # 每帧独立处理（不推荐，可能导致频闪）
+        # 注意：这个警告只在用户明确指定 --per_frame_tone_mapping 时才会触发
         for i in range(N):
             frame = frames[i]  # (H, W, C)
             sdr_frame, params = tone_map_hdr_to_sdr(frame, method, exposure)
             sdr_frames.append(sdr_frame)
             params_list.append(params)
     else:
-        # 全局处理（使用所有帧的最大值）
-        global_max = frames.max().item()
+        # 全局处理（使用所有帧的最大值，避免频闪）
+        # 对于 logarithmic 方法，需要使用全局 l_max
         white_point = global_max * exposure if method == 'reinhard' else None
         
         for i in range(N):
             frame = frames[i]
-            sdr_frame, params = tone_map_hdr_to_sdr(frame, method, exposure, white_point)
+            if method == 'logarithmic':
+                # 使用全局 l_max 的对数映射
+                sdr_frame, params = _logarithmic_tone_map_with_global_lmax(
+                    frame, exposure, global_max * exposure
+                )
+            elif method == 'reinhard':
+                sdr_frame, params = tone_map_hdr_to_sdr(frame, method, exposure, white_point)
+            else:
+                sdr_frame, params = tone_map_hdr_to_sdr(frame, method, exposure)
+            
+            # 确保记录全局最大值
+            params['global_l_max'] = global_max * exposure
+            params['global_max_hdr'] = global_max
             sdr_frames.append(sdr_frame)
             params_list.append(params)
     
     return torch.stack(sdr_frames, dim=0), params_list
+
+
+def _logarithmic_tone_map_with_global_lmax(
+    hdr: torch.Tensor, 
+    exposure: float, 
+    global_l_max: float
+) -> Tuple[torch.Tensor, dict]:
+    """使用全局 l_max 的对数 Tone Mapping（避免帧间不一致）"""
+    ldr = hdr * exposure
+    
+    if global_l_max <= 0:
+        return torch.zeros_like(hdr), {
+            'method': 'logarithmic', 
+            'exposure': exposure, 
+            'l_max': 0.0, 
+            'max_hdr': hdr.max().item(),
+            'frame_max': hdr.max().item()
+        }
+    
+    # 使用全局 l_max 进行对数映射（关键：避免每帧参数不同导致频闪）
+    sdr = torch.log1p(ldr) / np.log1p(global_l_max)
+    sdr = torch.clamp(sdr, 0.0, 1.0)
+    
+    params = {
+        'method': 'logarithmic',
+        'exposure': exposure,
+        'l_max': global_l_max,  # 使用全局 l_max
+        'max_hdr': hdr.max().item(),  # 保留原始帧的最大值
+        'frame_max': hdr.max().item(),  # 帧级最大值（用于调试）
+    }
+    
+    return sdr, params
 
 
 def apply_inverse_tone_mapping_to_frames(

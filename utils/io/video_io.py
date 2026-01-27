@@ -26,18 +26,26 @@ def log(msg, level="info"):
     print(f"{prefix} {msg}")
 
 
-def save_frame_as_dpx10(frame: np.ndarray, path: str, hdr_max: float = None) -> bool:
+def save_frame_as_dpx10(frame: np.ndarray, path: str, hdr_max: float = None, apply_srgb_gamma: bool = True) -> bool:
     """将单帧 float RGB (H,W,3) 保存为 10-bit DPX。
     
     支持 SDR [0,1] 和 HDR (>1) 输入。
     
     Args:
-        frame: 输入帧 (H,W,3)，可能是 HDR（值 > 1）
+        frame: 输入帧 (H,W,3)，可能是 HDR（值 > 1），应该是线性RGB
         path: 输出路径
         hdr_max: HDR 全局最大值（用于归一化）。如果为 None，使用帧内最大值（每帧独立归一化）。
                 如果提供，使用全局归一化（保留绝对亮度关系）。
+        apply_srgb_gamma: 是否应用 sRGB 伽马校正（默认 True）
+            - True: 保存为 sRGB 编码（SDR格式），在标准显示器上正确显示
+            - False: 保存为线性 RGB（HDR格式），用于生成 HDR 视频
     
     依赖 FFmpeg，优先用 gbrp10le；若不支持则回退到 rgb48le（10bit 置高位的 16bit 容器）。
+    
+    注意：
+    - 输入应该是线性RGB（经过逆色调映射后的HDR值）
+    - 如果 apply_srgb_gamma=True：保存为 sRGB 编码（SDR），在标准显示器上正确显示
+    - 如果 apply_srgb_gamma=False：保存为线性 RGB（HDR），用于生成 HDR 视频
     """
     if frame.ndim != 3 or frame.shape[2] != 3:
         raise ValueError(f"save_frame_as_dpx10: need (H,W,3) RGB, got shape {frame.shape}")
@@ -58,8 +66,28 @@ def save_frame_as_dpx10(frame: np.ndarray, path: str, hdr_max: float = None) -> 
         # SDR 输入：确保在 [0, 1]
         frame = np.clip(frame, 0.0, 1.0)
     
+    # 关键修复：根据选项决定是否应用 sRGB 伽马校正
+    if apply_srgb_gamma:
+        # 应用 sRGB 伽马校正（线性RGB -> sRGB）
+        # 这解决了"灰色视频"问题：DPX保存的是线性RGB，但播放器期望sRGB
+        # sRGB伽马曲线：对于 x <= 0.0031308，使用线性；否则使用 1.055 * x^(1/2.4) - 0.055
+        linear_threshold = 0.0031308
+        srgb_gamma = 1.0 / 2.4
+        
+        # 应用sRGB伽马校正
+        frame_encoded = np.where(
+            frame <= linear_threshold,
+            frame * 12.92,  # 线性部分
+            1.055 * np.power(frame, srgb_gamma) - 0.055  # 非线性部分
+        )
+        frame_encoded = np.clip(frame_encoded, 0.0, 1.0)
+    else:
+        # 保持线性 RGB（HDR格式）
+        # 不应用伽马校正，保持线性编码
+        frame_encoded = np.clip(frame, 0.0, 1.0)
+    
     # 10-bit: 0–1023（按照图片建议的方式）
-    f10 = (frame * 1023.0).round().clip(0, 1023).astype(np.uint16)
+    f10 = (frame_encoded * 1023.0).round().clip(0, 1023).astype(np.uint16)
     # gbrp10le: planar G,B,R，每通道 H*W 个 uint16 LE
     g = f10[:, :, 1].tobytes()
     b = f10[:, :, 2].tobytes()
