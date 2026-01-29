@@ -25,8 +25,6 @@ Running FlashVSR on lower VRAM without any artifacts.
 #### 2025-10-21
 - Initial this project, introducing features such as `tile_dit` to significantly reducing VRAM usage.
 
-## Preview
-![](./img/preview.jpg)
 
 ## Installation
 
