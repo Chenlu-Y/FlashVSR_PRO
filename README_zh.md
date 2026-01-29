@@ -301,6 +301,8 @@ python scripts/infer_video.py \
 
 适用：HDR输入视频，保留HDR信息
 
+**步骤1：运行推理（输出线性RGB DPX）**
+
 ```bash
 python scripts/infer_video_distributed.py \
   --input ./inputs/hdr_video.mp4 \
@@ -309,11 +311,34 @@ python scripts/infer_video_distributed.py \
   --output_format dpx10 \
   --hdr_mode \
   --tone_mapping_method logarithmic \
-  --tone_mapping_exposure 1.0 \
   --mode tiny \
-  --scale 4 \
+  --scale 2 \
+  --tiled_dit True \
+  --tiled_vae True \
+  --tile_size 512 \
+  --tile_overlap 384 \
+  --color_fix True \
   --devices all
 ```
+
+**步骤2：将DPX序列编码为HDR视频（HDR10格式）**
+
+```bash
+python utils/io/hdr_video_encode.py \
+  --input ./results/hdr_frames/ \
+  --output ./results/hdr_output.mp4 \
+  --fps 30.0 \
+  --hdr_format hdr10 \
+  --crf 18 \
+  --preset slow \
+  --simple
+```
+
+**关键参数说明：**
+- `--hdr_mode`：启用HDR处理流程（Tone Mapping → 超分 → Inverse Tone Mapping）
+- `--tile_overlap 384`：增加重叠区域，减少高动态范围区域的边界伪影
+- `--hdr_format hdr10`：输出HDR10格式（使用 `hlg` 可输出HLG格式）
+- `--simple`：使用简化编码模式（推荐）
 
 #### 场景8：图像序列输入/输出
 

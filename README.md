@@ -301,6 +301,8 @@ python scripts/infer_video.py \
 
 Best for: HDR input videos, preserving HDR information
 
+**Step 1: Run inference with HDR mode (output linear RGB DPX)**
+
 ```bash
 python scripts/infer_video_distributed.py \
   --input ./inputs/hdr_video.mp4 \
@@ -309,11 +311,34 @@ python scripts/infer_video_distributed.py \
   --output_format dpx10 \
   --hdr_mode \
   --tone_mapping_method logarithmic \
-  --tone_mapping_exposure 1.0 \
   --mode tiny \
-  --scale 4 \
+  --scale 2 \
+  --tiled_dit True \
+  --tiled_vae True \
+  --tile_size 512 \
+  --tile_overlap 384 \
+  --color_fix True \
   --devices all
 ```
+
+**Step 2: Encode DPX sequence to HDR video (HDR10 format)**
+
+```bash
+python utils/io/hdr_video_encode.py \
+  --input ./results/hdr_frames/ \
+  --output ./results/hdr_output.mp4 \
+  --fps 30.0 \
+  --hdr_format hdr10 \
+  --crf 18 \
+  --preset slow \
+  --simple
+```
+
+**Key parameters explained:**
+- `--hdr_mode`: Enable HDR processing workflow (Tone Mapping → Super-resolution → Inverse Tone Mapping)
+- `--tile_overlap 384`: Increased overlap to reduce boundary artifacts in high dynamic range areas
+- `--hdr_format hdr10`: Output HDR10 format (use `hlg` for HLG format)
+- `--simple`: Use simplified encoding mode (recommended)
 
 #### Scenario 8: Image Sequence Input/Output
 

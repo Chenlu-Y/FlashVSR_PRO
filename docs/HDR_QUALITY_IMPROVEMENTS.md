@@ -14,7 +14,6 @@ docker exec -w /app/FlashVSR_Ultra_Fast flashvsr_ultra_fast python scripts/infer
     --output_format dpx10 \
     --hdr_mode \
     --tone_mapping_method logarithmic \
-    --dpx_linear_rgb \
     --mode tiny \
     --scale 2 \
     --fps 30.0 \
@@ -32,7 +31,7 @@ docker exec -w /app/FlashVSR_Ultra_Fast flashvsr_ultra_fast python scripts/infer
 ```
 
 **关键参数**：
-- `--dpx_linear_rgb`：保存为线性 RGB（HDR格式），用于生成 HDR 视频
+- `--hdr_mode`：启用 HDR 处理流程
 - `--tile_overlap 384`：增加重叠（原来是 256），减少边界伪影
 
 ## 可选参数

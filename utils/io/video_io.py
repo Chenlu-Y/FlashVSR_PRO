@@ -53,17 +53,20 @@ def save_frame_as_dpx10(frame: np.ndarray, path: str, hdr_max: float = None, app
     frame = np.ascontiguousarray(frame.astype(np.float32))
     
     # 处理 HDR：归一化到 [0, 1]
+    # 关键修复：始终使用全局最大值归一化（如果提供），保持帧间亮度比例一致
+    # 这是避免闪烁的关键！
     frame_max = frame.max()
-    if frame_max > 1.0:
-        # HDR 输入：使用全局最大值或帧内最大值归一化
-        if hdr_max is not None and hdr_max > 1.0:
-            # 使用全局最大值（保留绝对亮度关系）
-            frame = frame / hdr_max
-        else:
-            # 使用帧内最大值（每帧独立归一化，丢失绝对亮度）
-            frame = frame / frame_max
+    
+    if hdr_max is not None and hdr_max > 1.0:
+        # 使用全局最大值归一化（推荐，保留帧间相对亮度关系，避免闪烁）
+        # 注意：即使当前帧的最大值 <= 1.0（暗帧），也使用全局归一化
+        # 这样所有帧的亮度比例都是一致的
+        frame = frame / hdr_max
+    elif frame_max > 1.0:
+        # HDR 输入但没有提供全局最大值：使用帧内最大值（不推荐，可能导致帧间闪烁）
+        frame = frame / frame_max
     else:
-        # SDR 输入：确保在 [0, 1]
+        # SDR 输入（所有值 <= 1.0 且没有提供 hdr_max）：确保在 [0, 1]
         frame = np.clip(frame, 0.0, 1.0)
     
     # 关键修复：根据选项决定是否应用 sRGB 伽马校正

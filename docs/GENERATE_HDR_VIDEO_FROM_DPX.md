@@ -2,11 +2,11 @@
 
 ## 快速开始
 
-如果您已经从 checkpoint 重新生成了线性 RGB DPX 文件，使用以下命令生成 HDR 视频：
+使用以下命令将 DPX 文件转换为 HDR 视频：
 
 ```bash
 python utils/io/hdr_video_encode.py \
-    --input /app/output/test_hdr_8K_linear/ \
+    --input /app/output/test_hdr_8K/ \
     --output /app/output/test_hdr_8K_hdr10.mp4 \
     --fps 30.0 \
     --hdr_format hdr10 \
@@ -20,7 +20,8 @@ python utils/io/hdr_video_encode.py \
 - `--output`: 输出 HDR 视频路径
 - `--fps`: 帧率（与原始视频一致）
 - `--simple`: 使用简化模式（推荐）
-- `--dpx_is_linear`: 默认已启用（从 checkpoint 重新生成的 DPX 是线性 RGB）
+
+> **注意**：默认假设 DPX 是 sRGB 编码（推荐）。如果 DPX 是线性 RGB 格式，添加 `--dpx_is_linear` 参数（不推荐，FFmpeg 转换可能有问题）。
 
 ## 完整工作流
 
@@ -180,12 +181,12 @@ ffprobe -v error -select_streams v:0 \
 
 ## 总结
 
-✅ **从 checkpoint 重新生成的 DPX 是线性 RGB（HDR格式）**
+✅ **推荐工作流：使用 sRGB 编码的 DPX（默认行为）**
 
 ✅ **使用 `--simple` 模式生成 HDR 视频（推荐）**
 
-✅ **默认已启用 `--dpx_is_linear`（无需指定）**
+✅ **不推荐使用 `--dpx_is_linear`**（FFmpeg 的线性 RGB 转换可能有问题）
 
-✅ **如果 DPX 是 sRGB 格式，使用 `--dpx_is_srgb` 参数**
+✅ **生成 DPX 时不要使用 `--dpx_linear_rgb`**（使用默认的 sRGB 编码）
 
-现在您可以轻松地从线性 RGB DPX 文件生成 HDR 视频了！
+现在您可以轻松地从 DPX 文件生成 HDR 视频了！

@@ -88,20 +88,22 @@ def read_dpx_frame(dpx_path: str) -> np.ndarray:
         raise RuntimeError(f"读取 DPX 文件失败: {e}")
 
 
-def read_hdr_video_frame_range(video_path: str, start_idx: int, end_idx: int) -> Tuple[np.ndarray, float]:
-    """读取 HDR 视频的指定帧范围，保持 HDR 信息。
+def read_hdr_video_frame_range(video_path: str, start_idx: int, end_idx: int, 
+                                convert_to_hlg: bool = True) -> Tuple[np.ndarray, float]:
+    """读取 HDR 视频的指定帧范围。
     
     Args:
         video_path: HDR 视频文件路径
         start_idx: 起始帧索引（包含）
         end_idx: 结束帧索引（不包含）
+        convert_to_hlg: 是否将 PQ/HDR 转换为 HLG 编码（推荐用于 AI 超分）
+            - True (默认): 使用 zscale 将 PQ 转换为 HLG，输出 [0, 1] 范围，
+                          效果类似 SDR，适合送入 SDR AI 模型
+            - False: 读取原始 PQ 值（错误的归一化方式，不推荐）
     
     Returns:
-        (frames, fps): frames 是 (N, H, W, 3) float，值可能 > 1.0（HDR）；fps 是帧率
+        (frames, fps): frames 是 (N, H, W, 3) float [0, 1]；fps 是帧率
     """
-    # 使用 FFmpeg 读取 HDR 视频，保持原始位深和颜色空间
-    # 输出为 float32，值范围取决于 HDR 编码方式（PQ/HLG）
-    
     # 先获取视频信息
     probe_cmd = [
         "ffprobe", "-v", "error",
@@ -122,30 +124,55 @@ def read_hdr_video_frame_range(video_path: str, start_idx: int, end_idx: int) ->
     
     # 读取指定范围的帧
     num_frames = end_idx - start_idx
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(start_idx / fps),  # 跳转到起始帧
-        "-i", video_path,
-        "-frames:v", str(num_frames),
-        "-f", "rawvideo",
-        "-pix_fmt", "rgb48le",  # 16-bit RGB，可以承载 HDR 数据
-        "-",
-    ]
+    
+    if convert_to_hlg:
+        # 推荐方式：使用 zscale 将 PQ 转换为 HLG
+        # 这会产生类似 SDR 的输出，适合送入 SDR AI 模型
+        # 效果等同于: ffmpeg -i input.mov -vf "zscale=t=arib-std-b67:m=bt2020nc:r=limited" ...
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start_idx / fps),
+            "-i", video_path,
+            "-frames:v", str(num_frames),
+            "-vf", "zscale=t=arib-std-b67:m=bt2020nc:r=full,format=rgb48le",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb48le",
+            "-",
+        ]
+    else:
+        # 旧方式：直接读取原始值（不推荐，会导致归一化错误）
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start_idx / fps),
+            "-i", video_path,
+            "-frames:v", str(num_frames),
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb48le",
+            "-",
+        ]
     
     try:
         result = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            check=True
+            check=False  # 不要自动抛异常，我们自己处理
         )
+        
+        # 检查是否成功
+        if result.returncode != 0:
+            stderr = result.stderr.decode('utf-8', errors='ignore')
+            # 如果 zscale 失败（可能没有安装 zimg），回退到简单方式
+            if 'zscale' in stderr or 'zimg' in stderr:
+                print(f"[WARN] zscale 不可用，回退到简单读取方式。建议安装 zimg: apt install libzimg-dev")
+                return read_hdr_video_frame_range_simple(video_path, start_idx, end_idx, w, h, fps, num_frames)
+            raise RuntimeError(f"FFmpeg 读取失败: {stderr[:500]}")
         
         # 读取原始数据
         raw_data = result.stdout
         expected_size = num_frames * h * w * 3 * 2  # rgb48le: 每个通道 16-bit
         
         if len(raw_data) < expected_size:
-            # 可能读取的帧数少于请求的帧数
             actual_frames = len(raw_data) // (h * w * 3 * 2)
             if actual_frames == 0:
                 raise RuntimeError(f"未读取到任何帧")
@@ -155,23 +182,58 @@ def read_hdr_video_frame_range(video_path: str, start_idx: int, end_idx: int) ->
         frames_uint16 = np.frombuffer(raw_data[:num_frames * h * w * 3 * 2], dtype=np.uint16)
         frames_uint16 = frames_uint16.reshape(num_frames, h, w, 3)
         
-        # 转换为 float
-        # HDR 视频（H.265/HEVC）通常使用 10-bit 或 12-bit 编码
-        # 这里假设是 10-bit，值范围 0-1023
-        # 对于 PQ/HLG 编码的 HDR，值可能需要特殊处理
-        # 这里先简单转换为 [0, 1] 范围，但允许 > 1.0（HDR）
-        frames_float = frames_uint16.astype(np.float32) / 1023.0
-        
-        # 注意：HDR 视频的值可能已经超出标准范围
-        # 我们保持原始值，不强制限制到 [0, 1]
+        # 正确归一化：rgb48le 是 16-bit，范围 0-65535
+        frames_float = frames_uint16.astype(np.float32) / 65535.0
         
         return frames_float, fps
     
-    except subprocess.CalledProcessError as e:
-        stderr = e.stderr.decode('utf-8', errors='ignore')
-        raise RuntimeError(f"FFmpeg 读取 HDR 视频失败: {stderr[:500]}")
     except Exception as e:
         raise RuntimeError(f"读取 HDR 视频失败: {e}")
+
+
+def read_hdr_video_frame_range_simple(video_path: str, start_idx: int, end_idx: int,
+                                       w: int, h: int, fps: float, num_frames: int) -> Tuple[np.ndarray, float]:
+    """简单的 HDR 视频读取（当 zscale 不可用时的回退方案）
+    
+    使用简单的 format 转换，然后手动应用 gamma 校正
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start_idx / fps),
+        "-i", video_path,
+        "-frames:v", str(num_frames),
+        "-f", "rawvideo",
+        "-pix_fmt", "rgb48le",
+        "-",
+    ]
+    
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True
+    )
+    
+    raw_data = result.stdout
+    expected_size = num_frames * h * w * 3 * 2
+    
+    if len(raw_data) < expected_size:
+        actual_frames = len(raw_data) // (h * w * 3 * 2)
+        if actual_frames == 0:
+            raise RuntimeError(f"未读取到任何帧")
+        num_frames = actual_frames
+    
+    frames_uint16 = np.frombuffer(raw_data[:num_frames * h * w * 3 * 2], dtype=np.uint16)
+    frames_uint16 = frames_uint16.reshape(num_frames, h, w, 3)
+    
+    # 正确归一化：16-bit 范围 0-65535
+    frames_float = frames_uint16.astype(np.float32) / 65535.0
+    
+    # 简单方案：归一化后应用 gamma 2.2（模拟 SDR 效果）
+    # 这不如 HLG 转换精确，但比原来的错误方法好得多
+    frames_float = np.power(np.clip(frames_float, 0.0, 1.0), 1.0 / 2.2)
+    
+    return frames_float, fps
 
 
 def detect_hdr_input(input_path: str, hdr_mode: bool = False) -> bool:

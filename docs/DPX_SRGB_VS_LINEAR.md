@@ -193,12 +193,14 @@ python scripts/infer_video_distributed.py \
 
 ## 总结
 
-✅ **您说得对**：DPX 文件应该是 HDR 格式的（线性 RGB）
+✅ **推荐使用 sRGB 编码的 DPX**（默认行为）：FFmpeg 转换更稳定，结果更可靠
 
-✅ **已修复**：添加了 `--dpx_linear_rgb` 选项，可以保存为线性 RGB（HDR格式）
+✅ **`--dpx_linear_rgb` 参数仍然可用**，但不推荐使用（FFmpeg 的线性 RGB 转换可能有问题）
 
-✅ **默认行为**：为了向后兼容，默认仍保存为 sRGB（SDR格式），但可以通过参数选择
+✅ **默认行为**：保存为 sRGB 编码，使用标准的 HDR 视频转换流程
 
-✅ **恢复工具**：默认保存为线性 RGB（HDR格式），因为通常用于生成 HDR 视频
+✅ **如果遇到 HDR 视频亮度问题**：确保不使用 `--dpx_linear_rgb` 和 `--dpx_is_linear` 参数
 
-现在您可以选择保存真正的 HDR DPX 文件了！
+推荐的 HDR 工作流：
+1. 生成 DPX 时使用默认设置（sRGB 编码）
+2. 转换为 HDR 视频时使用默认设置（不需要 `--dpx_is_linear`）

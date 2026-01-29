@@ -298,10 +298,16 @@ def apply_tone_mapping_to_frames(
     params_list = []
     
     # 计算全局最大值（用于全局模式或作为参考）
+    # 注意：global_l_max 参数如果提供，应该是**已经乘过 exposure 的值**（即 原始max * exposure）
+    # 所以这里直接使用，不再额外乘 exposure
     if global_l_max is None:
-        global_max = frames.max().item()
+        # 没有提供全局参数，使用当前 frames 的最大值
+        global_max_raw = frames.max().item()  # 原始最大值（未乘 exposure）
+        computed_l_max = global_max_raw * exposure  # l_max = 原始max * exposure
     else:
-        global_max = global_l_max
+        # 使用提供的全局 l_max（已经乘过 exposure）
+        computed_l_max = global_l_max
+        global_max_raw = global_l_max / exposure if exposure > 0 else global_l_max  # 反推原始最大值
     
     if per_frame and global_l_max is None:
         # 每帧独立处理（不推荐，可能导致频闪）
@@ -314,23 +320,24 @@ def apply_tone_mapping_to_frames(
     else:
         # 全局处理（使用所有帧的最大值，避免频闪）
         # 对于 logarithmic 方法，需要使用全局 l_max
-        white_point = global_max * exposure if method == 'reinhard' else None
+        white_point = computed_l_max if method == 'reinhard' else None
         
         for i in range(N):
             frame = frames[i]
             if method == 'logarithmic':
                 # 使用全局 l_max 的对数映射
+                # 注意：传入的是 computed_l_max，已经乘过 exposure，不需要再乘
                 sdr_frame, params = _logarithmic_tone_map_with_global_lmax(
-                    frame, exposure, global_max * exposure
+                    frame, exposure, computed_l_max
                 )
             elif method == 'reinhard':
                 sdr_frame, params = tone_map_hdr_to_sdr(frame, method, exposure, white_point)
             else:
                 sdr_frame, params = tone_map_hdr_to_sdr(frame, method, exposure)
             
-            # 确保记录全局最大值
-            params['global_l_max'] = global_max * exposure
-            params['global_max_hdr'] = global_max
+            # 确保记录全局最大值（用于 Inverse Tone Mapping）
+            params['global_l_max'] = computed_l_max  # 已乘 exposure 的 l_max
+            params['global_max_hdr'] = global_max_raw  # 原始最大值（未乘 exposure）
             sdr_frames.append(sdr_frame)
             params_list.append(params)
     
