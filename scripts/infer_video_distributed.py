@@ -1807,16 +1807,57 @@ def process_tile_batch_distributed(pipe, frames, device, dtype, args, tile_batch
 def run_inference_distributed_segment(pipe, frames, device, dtype, args, rank: int, checkpoint_dir: str = None):
     """在单个segment上运行完整的推理流程（支持内存映射和断点续跑）。
     
-    关键优化：
-    1. 使用内存映射文件（mmap）存储 canvas，避免内存不足
-    2. Tile 级流式输出：处理完一个 tile 就写入磁盘
-    3. 支持断点续跑：可以从中断点恢复
+    tiled_dit 与 tiled_vae 互不相干，由参数支配（与 nodes.py 一致）：
+    - tiled_dit=False：整图进 pipe，不做空间分块
+    - tiled_dit=True：输入按 tile 切，每块进 pipe 再拼到 canvas
+    - tiled_vae：传给 pipe 的 tiled=，控制 VAE 解码是否内部分块
+    
+    Tile 路径下的优化：
+    1. 使用内存映射文件（mmap）存储 canvas
+    2. Tile 级流式输出、断点续跑
     """
     N, H, W, C = frames.shape
-    # 关键修改：使用原始输入帧数 N 作为 canvas 大小，而不是 num_aligned_frames
-    # 这样确保输出帧数 = 输入帧数，一一对应
     out_H, out_W = H * args.scale, W * args.scale
-    
+
+    # 整图路径（tiled_dit=False）：整图进 pipe，tiled_vae 控制 VAE 内部分块
+    if not args.tiled_dit:
+        log(f"[Rank {rank}] Whole-frame path (tiled_dit=False, tiled_vae={args.tiled_vae})", "info", rank)
+        LQ, th, tw, F, N0 = prepare_input_tensor(frames, device, scale=args.scale, dtype=dtype)
+        if "long" not in args.mode:
+            LQ = LQ.to(device)
+        topk_ratio = args.sparse_ratio * 768 * 1280 / (th * tw)
+        with torch.no_grad():
+            output = pipe(
+                prompt="",
+                negative_prompt="",
+                cfg_scale=1.0,
+                num_inference_steps=1,
+                seed=args.seed,
+                tiled=args.tiled_vae,
+                LQ_video=LQ,
+                num_frames=F,
+                height=th,
+                width=tw,
+                is_full_block=False,
+                if_buffer=True,
+                topk_ratio=topk_ratio,
+                kv_ratio=args.kv_ratio,
+                local_range=args.local_range,
+                color_fix=args.color_fix,
+                unload_dit=args.unload_dit,
+            )
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+        final_output = tensor2video(output).to("cpu")
+        if final_output.shape[0] > N:
+            final_output = final_output[:N]
+        del output, LQ
+        clean_vram()
+        log(f"[Rank {rank}] Whole-frame done: {final_output.shape[0]} frames (1-to-1 with input)", "info", rank)
+        return final_output
+
+    # Tile 路径（tiled_dit=True）：输入按 tile 切，每块进 pipe，拼到 canvas
+    log(f"[Rank {rank}] Tile path (tiled_dit=True, tiled_vae={args.tiled_vae})", "info", rank)
     # 计算tile坐标
     tile_coords = calculate_tile_coords(H, W, args.tile_size, args.tile_overlap)
     log(f"[Rank {rank}] Input resolution: {H}x{W}, Tile size: {args.tile_size}, Overlap: {args.tile_overlap}", "info", rank)

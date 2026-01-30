@@ -5,7 +5,6 @@
 ```
 FlashVSR_Ultra_Fast/
 ├── README.md, README_zh.md, LICENSE, requirements.txt  # 根目录文档
-├── nodes.py                                             # ComfyUI 节点（保留在根目录）
 │
 ├── scripts/                    # 主要推理脚本（入口点）
 │   ├── infer_video.py
