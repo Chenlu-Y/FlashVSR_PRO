@@ -8,6 +8,8 @@ from .support import (
     get_gpu_memory_info,
     get_available_memory_gb,
     estimate_tile_memory,
+    get_context_padded_crop,
+    get_tile_output_size,
     calculate_tile_coords,
     create_feather_mask,
 )
@@ -21,6 +23,8 @@ __all__ = [
     "get_gpu_memory_info",
     "get_available_memory_gb",
     "estimate_tile_memory",
+    "get_context_padded_crop",
+    "get_tile_output_size",
     "calculate_tile_coords",
     "create_feather_mask",
 ]

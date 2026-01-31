@@ -31,6 +31,8 @@ from utils.inference_support import (
     estimate_tile_memory,
     get_gpu_memory_info,
     get_available_memory_gb,
+    get_context_padded_crop,
+    get_tile_output_size,
 )
 from src.models.model_manager import ModelManager
 from src.models.TCDecoder import build_tcdecoder
@@ -274,8 +276,14 @@ def process_tile_batch_distributed(pipe, frames, device, dtype, args, tile_batch
     N, H, W, C = frames.shape
     results = []
 
+    context_margin = getattr(args, 'context_margin', 0)
+
     for tile_idx, (x1, y1, x2, y2) in enumerate(tile_batch):
-        input_tile = frames[:, y1:y2, x1:x2, :]
+        if context_margin > 0:
+            cx1, cy1, cx2, cy2 = get_context_padded_crop(x1, y1, x2, y2, W, H, context_margin)
+            input_tile = frames[:, cy1:cy2, cx1:cx2, :]
+        else:
+            input_tile = frames[:, y1:y2, x1:x2, :]
         N_tile = input_tile.shape[0]
 
         LQ_tile, th, tw, F, N0_tile = prepare_input_tensor(input_tile, device, scale=args.scale, dtype=dtype)
@@ -323,7 +331,18 @@ def process_tile_batch_distributed(pipe, frames, device, dtype, args, tile_batch
         if isinstance(output_tile, (tuple, list)):
             output_tile = output_tile[0]
 
-        processed_tile_cpu = tensor2video(output_tile).to("cpu")
+        processed_full = tensor2video(output_tile).to("cpu")
+
+        if context_margin > 0:
+            out_h_tile, out_w_tile = get_tile_output_size(x2 - x1, y2 - y1, args.scale)
+            full_h, full_w = processed_full.shape[1], processed_full.shape[2]
+            start_h = (full_h - out_h_tile) // 2
+            start_w = (full_w - out_w_tile) // 2
+            processed_tile_cpu = processed_full[:, start_h:start_h + out_h_tile, start_w:start_w + out_w_tile, :].contiguous()
+            del processed_full
+        else:
+            processed_tile_cpu = processed_full
+            del processed_full
 
         if processed_tile_cpu.shape[0] < N0_tile:
             raise RuntimeError(
@@ -456,6 +475,7 @@ def run_inference_distributed_segment(pipe, frames, device, dtype, args, rank: i
 
     total_processed = 0
     flush_counter = 0
+    tile_start_time = time.time()
 
     for batch_idx, tile_batch in enumerate(tile_batches):
         tiles_to_process = []
@@ -546,17 +566,15 @@ def run_inference_distributed_segment(pipe, frames, device, dtype, args, rank: i
 
         clean_vram()
 
-        progress_interval = max(1, min(len(tile_batches) // 10, 10))
-        if (batch_idx + 1) % progress_interval == 0 or (batch_idx + 1) == len(tile_batches):
-            percentage = 100.0 * total_processed / len(tile_coords)
-            log(f"[Rank {rank}] Tile progress: {total_processed}/{len(tile_coords)} ({percentage:.1f}%) [batch {batch_idx + 1}/{len(tile_batches)}]", "info", rank)
-            if checkpoint_dir:
-                progress_file = os.path.join(checkpoint_dir, f"rank_{rank}_progress.txt")
-                try:
-                    with open(progress_file, 'w') as f:
-                        f.write(f"{total_processed}\n{len(tile_coords)}\n{percentage:.1f}\n")
-                except Exception:
-                    pass
+        percentage = 100.0 * total_processed / len(tile_coords)
+        log(f"[Rank {rank}] Tile progress: {total_processed}/{len(tile_coords)} ({percentage:.1f}%) [batch {batch_idx + 1}/{len(tile_batches)}]", "info", rank)
+        if checkpoint_dir:
+            progress_file = os.path.join(checkpoint_dir, f"rank_{rank}_progress.txt")
+            try:
+                with open(progress_file, 'w') as f:
+                    f.write(f"{total_processed}\n{len(tile_coords)}\n{percentage:.1f}\n")
+            except Exception:
+                pass
 
     if use_mmap:
         canvas_mmap.flush()
@@ -585,6 +603,8 @@ def run_inference_distributed_segment(pipe, frames, device, dtype, args, rank: i
         else:
             raise RuntimeError(f"[Rank {rank}] ERROR: Output frames ({output.shape[0]}) < input frames ({N}).")
 
+    tile_elapsed = time.time() - tile_start_time
+    log(f"[Rank {rank}] Tile inference completed in {tile_elapsed:.1f}s ({tile_elapsed/60:.1f} min)", "info", rank)
     log(f"[Rank {rank}] Final output: {output.shape[0]} frames (1-to-1 with input)", "info", rank)
     return output
 

@@ -129,6 +129,25 @@ def estimate_tile_memory(tile_size: int, num_frames: int, scale: int, dtype_size
     return input_size + intermediate_size + output_size + overhead
 
 
+def get_context_padded_crop(
+    x1: int, y1: int, x2: int, y2: int,
+    width: int, height: int,
+    context_margin: int,
+) -> Tuple[int, int, int, int]:
+    """Return (cx1, cy1, cx2, cy2) for context-padded crop, clipped to [0, W] x [0, H]."""
+    cx1 = max(0, x1 - context_margin)
+    cy1 = max(0, y1 - context_margin)
+    cx2 = min(width, x2 + context_margin)
+    cy2 = min(height, y2 + context_margin)
+    return cx1, cy1, cx2, cy2
+
+
+def get_tile_output_size(tile_w: int, tile_h: int, scale: int = 4, multiple: int = 128) -> Tuple[int, int]:
+    """Return (out_h_tile, out_w_tile) for a logical tile of size (tile_w, tile_h) after pipeline."""
+    _, _, tW, tH = compute_scaled_and_target_dims(tile_w, tile_h, scale=scale, multiple=multiple)
+    return tH, tW
+
+
 def calculate_tile_coords(height, width, tile_size, overlap):
     """Calculate tile coordinates for patch-based inference."""
     coords = []
