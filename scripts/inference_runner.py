@@ -475,72 +475,23 @@ def process_tile_batch_distributed(
     return results
 
 
-def run_inference_distributed_segment(
-    pipe, frames, device, dtype, args, rank: int, checkpoint_dir: str = None
+def _run_tiled_inference_one_pass(
+    pipe,
+    frames,
+    device,
+    dtype,
+    args,
+    rank: int,
+    tile_coords: List[Tuple[int, int, int, int]],
+    N: int,
+    out_H: int,
+    out_W: int,
+    C: int,
+    checkpoint_dir: str | None,
 ):
-    """在单个 segment 上运行推理（tiled_dit 整图/tile 二选一，tiled_vae 独立控制 VAE 内部分块）。"""
-    N, H, W, C = frames.shape
-    out_H, out_W = H * args.scale, W * args.scale
-
-    if not args.tiled_dit:
-        log(
-            f"[Rank {rank}] Whole-frame path (tiled_dit=False, tiled_vae={args.tiled_vae})",
-            "info",
-            rank,
-        )
-        LQ, th, tw, F, N0 = prepare_input_tensor(
-            frames, device, scale=args.scale, dtype=dtype
-        )
-        if "long" not in args.mode:
-            LQ = LQ.to(device)
-        topk_ratio = args.sparse_ratio * 768 * 1280 / (th * tw)
-        with torch.no_grad():
-            output = pipe(
-                prompt="",
-                negative_prompt="",
-                cfg_scale=1.0,
-                num_inference_steps=1,
-                seed=args.seed,
-                tiled=args.tiled_vae,
-                LQ_video=LQ,
-                num_frames=F,
-                height=th,
-                width=tw,
-                is_full_block=False,
-                if_buffer=True,
-                topk_ratio=topk_ratio,
-                kv_ratio=args.kv_ratio,
-                local_range=args.local_range,
-                color_fix=args.color_fix,
-                unload_dit=args.unload_dit,
-            )
-        if isinstance(output, (tuple, list)):
-            output = output[0]
-        final_output = tensor2video(output).to("cpu")
-        if final_output.shape[0] > N:
-            final_output = final_output[:N]
-        del output, LQ
-        clean_vram()
-        log(
-            f"[Rank {rank}] Whole-frame done: {final_output.shape[0]} frames (1-to-1 with input)",
-            "info",
-            rank,
-        )
-        return final_output
-
-    log(
-        f"[Rank {rank}] Tile path (tiled_dit=True, tiled_vae={args.tiled_vae})",
-        "info",
-        rank,
-    )
-    tile_coords = calculate_tile_coords(H, W, args.tile_size, args.tile_overlap)
-    log(
-        f"[Rank {rank}] Input resolution: {H}x{W}, Tile size: {args.tile_size}, Overlap: {args.tile_overlap}",
-        "info",
-        rank,
-    )
-    log(f"[Rank {rank}] Calculated {len(tile_coords)} tiles to process", "info", rank)
-
+    """跑一遍 tiled 推理并累积到 canvas/weight_canvas，返回 (canvas, weight_canvas)。
+    checkpoint_dir 为 None 时不使用 mmap 与断点续跑（用于 tile_shift 双遍时的每一遍）。
+    """
     processed_tiles_file = (
         os.path.join(checkpoint_dir, f"rank_{rank}_processed_tiles.json")
         if checkpoint_dir
@@ -805,22 +756,123 @@ def run_inference_distributed_segment(
     if use_mmap:
         canvas_mmap.flush()
         weight_mmap.flush()
-        canvas_np = np.array(canvas_mmap, copy=True).astype(np.float32)
-        weight_np = np.array(weight_mmap, copy=True).astype(np.float32)
-        weight_np[weight_np == 0] = 1.0
-        output_np = canvas_np / weight_np
-        output = torch.from_numpy(output_np)
-    else:
-        weight_canvas[weight_canvas == 0] = 1.0
-        output = canvas / weight_canvas
 
-    if checkpoint_dir:
-        progress_file = os.path.join(checkpoint_dir, f"rank_{rank}_progress.txt")
-        try:
-            with open(progress_file, "w") as f:
-                f.write(f"{len(tile_coords)}\n{len(tile_coords)}\n100.0\n")
-        except Exception:
-            pass
+    return canvas, weight_canvas
+
+
+def run_inference_distributed_segment(
+    pipe, frames, device, dtype, args, rank: int, checkpoint_dir: str = None
+):
+    """在单个 segment 上运行推理（tiled_dit 整图/tile 二选一，tiled_vae 独立控制 VAE 内部分块）。"""
+    N, H, W, C = frames.shape
+    out_H, out_W = H * args.scale, W * args.scale
+
+    if not args.tiled_dit:
+        log(
+            f"[Rank {rank}] Whole-frame path (tiled_dit=False, tiled_vae={args.tiled_vae})",
+            "info",
+            rank,
+        )
+        LQ, th, tw, F, N0 = prepare_input_tensor(
+            frames, device, scale=args.scale, dtype=dtype
+        )
+        if "long" not in args.mode:
+            LQ = LQ.to(device)
+        topk_ratio = args.sparse_ratio * 768 * 1280 / (th * tw)
+        with torch.no_grad():
+            output = pipe(
+                prompt="",
+                negative_prompt="",
+                cfg_scale=1.0,
+                num_inference_steps=1,
+                seed=args.seed,
+                tiled=args.tiled_vae,
+                LQ_video=LQ,
+                num_frames=F,
+                height=th,
+                width=tw,
+                is_full_block=False,
+                if_buffer=True,
+                topk_ratio=topk_ratio,
+                kv_ratio=args.kv_ratio,
+                local_range=args.local_range,
+                color_fix=args.color_fix,
+                unload_dit=args.unload_dit,
+            )
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+        final_output = tensor2video(output).to("cpu")
+        if final_output.shape[0] > N:
+            final_output = final_output[:N]
+        del output, LQ
+        clean_vram()
+        log(
+            f"[Rank {rank}] Whole-frame done: {final_output.shape[0]} frames (1-to-1 with input)",
+            "info",
+            rank,
+        )
+        return final_output
+
+    log(
+        f"[Rank {rank}] Tile path (tiled_dit=True, tiled_vae={args.tiled_vae})",
+        "info",
+        rank,
+    )
+    tile_shift = getattr(args, "tile_shift", True)
+
+    if tile_shift:
+        # Tile Shift 双遍推理：正常网格 + 错位半 stride，两遍结果平均以打散固定网格纹
+        stride = args.tile_size - args.tile_overlap
+        shift_x, shift_y = stride // 2, stride // 2
+        coords1 = calculate_tile_coords(H, W, args.tile_size, args.tile_overlap)
+        coords2 = calculate_tile_coords(
+            H, W, args.tile_size, args.tile_overlap, shift_x, shift_y
+        )
+        log(
+            f"[Rank {rank}] Tile shift enabled: Pass1 {len(coords1)} tiles, Pass2 {len(coords2)} tiles (shift={shift_x},{shift_y})",
+            "info",
+            rank,
+        )
+        log(
+            f"[Rank {rank}] Input resolution: {H}x{W}, Tile size: {args.tile_size}, Overlap: {args.tile_overlap}",
+            "info",
+            rank,
+        )
+        log(f"[Rank {rank}] Pass 1: normal grid", "info", rank)
+        canvas1, weight1 = _run_tiled_inference_one_pass(
+            pipe, frames, device, dtype, args, rank,
+            coords1, N, out_H, out_W, C, checkpoint_dir=None,
+        )
+        log(f"[Rank {rank}] Pass 2: shifted grid (half stride)", "info", rank)
+        canvas2, weight2 = _run_tiled_inference_one_pass(
+            pipe, frames, device, dtype, args, rank,
+            coords2, N, out_H, out_W, C, checkpoint_dir=None,
+        )
+        out1 = canvas1 / (weight1 + 1e-6)
+        out2 = canvas2 / (weight2 + 1e-6)
+        output = (0.5 * out1.float() + 0.5 * out2.float())
+    else:
+        tile_coords = calculate_tile_coords(H, W, args.tile_size, args.tile_overlap)
+        log(
+            f"[Rank {rank}] Input resolution: {H}x{W}, Tile size: {args.tile_size}, Overlap: {args.tile_overlap}",
+            "info",
+            rank,
+        )
+        log(f"[Rank {rank}] Calculated {len(tile_coords)} tiles to process", "info", rank)
+        canvas, weight_canvas = _run_tiled_inference_one_pass(
+            pipe, frames, device, dtype, args, rank,
+            tile_coords, N, out_H, out_W, C, checkpoint_dir,
+        )
+        if checkpoint_dir:
+            progress_file = os.path.join(checkpoint_dir, f"rank_{rank}_progress.txt")
+            try:
+                with open(progress_file, "w") as f:
+                    f.write(f"{len(tile_coords)}\n{len(tile_coords)}\n100.0\n")
+            except Exception:
+                pass
+        weight_canvas = weight_canvas.clone()
+        weight_canvas[weight_canvas == 0] = 1.0
+        output = (canvas / weight_canvas).float()
 
     if output.shape[0] != N:
         log(

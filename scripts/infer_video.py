@@ -578,6 +578,8 @@ if __name__ == "__main__":
     parser.add_argument("--tiled_dit", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False, help="Use tiled DiT")
     parser.add_argument("--tile_size", type=int, default=256, help="Tile size")
     parser.add_argument("--tile_overlap", type=int, default=24, help="Tile overlap")
+    parser.add_argument("--tile_shift", type=lambda x: x.lower() in ['true', '1', 'yes'], default=True,
+                        help="Use tile shift (two-pass) to reduce grid seams when tiled_dit is on")
     parser.add_argument("--unload_dit", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False, help="Unload DiT before decoding")
     parser.add_argument("--sparse_ratio", type=float, default=2.0, help="Sparse ratio")
     parser.add_argument("--kv_ratio", type=float, default=3.0, help="KV ratio")
