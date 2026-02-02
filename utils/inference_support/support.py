@@ -34,25 +34,26 @@ def largest_8n1_leq(n):
 
 
 def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: int = 128):
-    """Compute scaled and target dimensions aligned to multiple."""
+    """Compute scaled and target dimensions aligned to multiple (round up to avoid boundary gaps)."""
     if w0 <= 0 or h0 <= 0:
         raise ValueError("Invalid input size")
     sW, sH = w0 * scale, h0 * scale
-    tW = max(multiple, (sW // multiple) * multiple)
-    tH = max(multiple, (sH // multiple) * multiple)
+    tW = max(multiple, int(math.ceil(sW / multiple)) * multiple)
+    tH = max(multiple, int(math.ceil(sH / multiple)) * multiple)
     return sW, sH, tW, tH
 
 
-def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: int, tH: int):
-    """Upscale and center-crop a tensor frame."""
+def tensor_upscale_then_pad(frame_tensor: torch.Tensor, scale: int, tW: int, tH: int):
+    """Upscale to (sW, sH) then pad on right/bottom to (tW, tH). Avoids boundary gaps when tW/tH are rounded up."""
     h0, w0, c = frame_tensor.shape
     tensor_bchw = frame_tensor.permute(2, 0, 1).unsqueeze(0)
     sW, sH = w0 * scale, h0 * scale
     upscaled = F.interpolate(tensor_bchw, size=(sH, sW), mode='bicubic', align_corners=False)
-    l = max(0, (sW - tW) // 2)
-    t = max(0, (sH - tH) // 2)
-    cropped = upscaled[:, :, t:t + tH, l:l + tW]
-    return cropped.squeeze(0)
+    if sW < tW or sH < tH:
+        pad_right = max(0, tW - sW)
+        pad_bottom = max(0, tH - sH)
+        upscaled = F.pad(upscaled, (0, pad_right, 0, pad_bottom), mode='replicate')
+    return upscaled.squeeze(0)
 
 
 def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16):
@@ -84,7 +85,7 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
     for i in range(F_):
         frame_idx = min(i, N0 - 1)
         frame_slice = image_tensor[frame_idx].to(device)
-        tensor_chw = tensor_upscale_then_center_crop(frame_slice, scale, tW, tH)
+        tensor_chw = tensor_upscale_then_pad(frame_slice, scale, tW, tH)
         tensor_out = tensor_chw * 2.0 - 1.0
         tensor_out = tensor_out.to('cpu').to(dtype)
         frames.append(tensor_out)
@@ -129,20 +130,35 @@ def estimate_tile_memory(tile_size: int, num_frames: int, scale: int, dtype_size
     return input_size + intermediate_size + output_size + overhead
 
 
-def calculate_tile_coords(height, width, tile_size, overlap):
-    """Calculate tile coordinates for patch-based inference."""
+def calculate_tile_coords(height, width, tile_size, overlap, shift_x=0, shift_y=0):
+    """Calculate tile coordinates for patch-based inference.
+
+    When shift_x/shift_y are set (e.g. half stride for tile shift), the grid is
+    offset so the second pass covers the same area with a shifted pattern.
+    """
     coords = []
     stride = tile_size - overlap
     num_rows = math.ceil((height - overlap) / stride)
     num_cols = math.ceil((width - overlap) / stride)
+    # With shift, we may need one extra row/col to cover boundaries
+    if shift_y:
+        num_rows += 1
+    if shift_x:
+        num_cols += 1
     for r in range(num_rows):
         for c in range(num_cols):
-            y1, x1 = r * stride, c * stride
-            y2, x2 = min(y1 + tile_size, height), min(x1 + tile_size, width)
+            y1 = shift_y + r * stride
+            x1 = shift_x + c * stride
+            y2 = min(y1 + tile_size, height)
+            x2 = min(x1 + tile_size, width)
+            if y1 >= height or x1 >= width:
+                continue
             if y2 - y1 < tile_size:
                 y1 = max(0, y2 - tile_size)
             if x2 - x1 < tile_size:
                 x1 = max(0, x2 - tile_size)
+            if y1 < 0 or x1 < 0:
+                continue
             coords.append((x1, y1, x2, y2))
     return coords
 

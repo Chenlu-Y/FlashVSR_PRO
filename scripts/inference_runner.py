@@ -459,11 +459,16 @@ def process_tile_batch_distributed(
         elif processed_tile_cpu.shape[0] > N0_tile:
             processed_tile_cpu = processed_tile_cpu[:N0_tile]
 
-        mask_nchw = create_feather_mask(
-            (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
-            args.tile_overlap,
-        ).to("cpu")
-        mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
+        # 按真实尺度裁剪到 (sH, sW)，避免右/下边界未覆盖导致黑边
+        sH, sW = (y2 - y1) * args.scale, (x2 - x1) * args.scale
+        th, tw = processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]
+        if th > sH or tw > sW:
+            processed_tile_cpu = processed_tile_cpu[:, :sH, :sW, :]
+        mask_nchw = create_feather_mask((th, tw), args.tile_overlap).to("cpu")
+        mask_nchw = mask_nchw[:, :, :sH, :sW]
+        mask_nhwc = mask_nchw.permute(0, 2, 3, 1).expand(
+            processed_tile_cpu.shape[0], -1, -1, -1
+        )
 
         results.append(
             {"coords": (x1, y1, x2, y2), "tile": processed_tile_cpu, "mask": mask_nhwc}
@@ -804,6 +809,9 @@ def run_inference_distributed_segment(
         final_output = tensor2video(output).to("cpu")
         if final_output.shape[0] > N:
             final_output = final_output[:N]
+        # 按真实输出尺寸裁剪，避免 128 对齐多出的右/下边出现黑边
+        if final_output.shape[1] > out_H or final_output.shape[2] > out_W:
+            final_output = final_output[:, :out_H, :out_W, :]
         del output, LQ
         clean_vram()
         log(
@@ -848,9 +856,10 @@ def run_inference_distributed_segment(
             pipe, frames, device, dtype, args, rank,
             coords2, N, out_H, out_W, C, checkpoint_dir=None,
         )
-        out1 = canvas1 / (weight1 + 1e-6)
-        out2 = canvas2 / (weight2 + 1e-6)
-        output = (0.5 * out1.float() + 0.5 * out2.float())
+        # 按权重合并两遍：仅第一遍覆盖的区域（上/左边界）保持正常亮度，重叠区按权重混合
+        total_canvas = canvas1 + canvas2
+        total_weight = weight1 + weight2
+        output = (total_canvas / (total_weight + 1e-6)).float()
     else:
         tile_coords = calculate_tile_coords(H, W, args.tile_size, args.tile_overlap)
         log(

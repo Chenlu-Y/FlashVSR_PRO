@@ -80,6 +80,7 @@ python -m pip install -U triton<3.3.0
 | `--tiled_dit` | bool | `False` | 使用分块DiT以显著降低显存占用（速度较慢） |
 | `--tile_size` | int | `256` | 分块处理时的tile大小 |
 | `--tile_overlap` | int | `24` | tile重叠像素数 |
+| `--tile_shift` | bool | `True` | 启用 tile 错位双遍推理，两遍结果平均以减轻网格接缝（仅当 `--tiled_dit` 开启时生效） |
 | `--unload_dit` | bool | `False` | 解码前卸载DiT以降低显存峰值（速度较慢） |
 | `--precision` | str | `bf16` | 精度：`fp32`、`fp16` 或 `bf16` |
 | `--attention_mode` | str | `sparse_sage_attention` | 注意力模式：`sparse_sage_attention` 或 `block_sparse_attention` |

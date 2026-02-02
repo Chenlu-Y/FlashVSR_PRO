@@ -80,6 +80,7 @@ Two inference scripts are available:
 | `--tiled_dit` | bool | `False` | Use tiled DiT to significantly reduce VRAM usage (slower) |
 | `--tile_size` | int | `256` | Tile size for tiled processing |
 | `--tile_overlap` | int | `24` | Tile overlap in pixels |
+| `--tile_shift` | bool | `True` | Use tile shift (two-pass with offset grid); average two passes to reduce grid seams (only when `--tiled_dit` is on) |
 | `--unload_dit` | bool | `False` | Unload DiT before decoding to reduce VRAM peak (slower) |
 | `--precision` | str | `bf16` | Precision: `fp32`, `fp16`, or `bf16` |
 | `--attention_mode` | str | `sparse_sage_attention` | Attention mode: `sparse_sage_attention` or `block_sparse_attention` |
