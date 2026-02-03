@@ -348,14 +348,17 @@ class FlashVSRTinyLongPipeline(BasePipeline):
             num_frames = (num_frames + 2) // 4 * 4 + 1
             print(f"Only `num_frames % 4 != 1` is acceptable. We round it up to {num_frames}.")
 
+        # Batch 维：支持 batched tile 推理（B > 1）
+        B = LQ_video.shape[0] if LQ_video is not None else 1
+
         # Tiler 参数
         tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
 
         # 初始化噪声
         if if_buffer:
-            noise = self.generate_noise((1, 16, (num_frames - 1) // 4, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
+            noise = self.generate_noise((B, 16, (num_frames - 1) // 4, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
         else:
-            noise = self.generate_noise((1, 16, (num_frames - 1) // 4 + 1, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
+            noise = self.generate_noise((B, 16, (num_frames - 1) // 4 + 1, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
         # noise = noise.to(dtype=self.torch_dtype, device=self.device)
         latents = noise
 
@@ -446,16 +449,29 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                     show_progress_bar=False,
                     cond=cur_LQ_frame).transpose(1, 2).mul_(2).sub_(1)
 
-                # 颜色校正（wavelet）
+                # 颜色校正（wavelet）：B>1 时逐样本做
                 try:
                     if color_fix:
-                        cur_frames = self.ColorCorrector(
-                            cur_frames.to(device=self.device),
-                            cur_LQ_frame,
-                            clip_range=(-1, 1),
-                            chunk_size=None,
-                            method='adain'
-                        )
+                        if B > 1:
+                            frames_list = []
+                            for b in range(B):
+                                fb = self.ColorCorrector(
+                                    cur_frames[b:b+1].to(device=self.device),
+                                    cur_LQ_frame[b:b+1],
+                                    clip_range=(-1, 1),
+                                    chunk_size=None,
+                                    method='adain'
+                                )
+                                frames_list.append(fb)
+                            cur_frames = torch.cat(frames_list, dim=0)
+                        else:
+                            cur_frames = self.ColorCorrector(
+                                cur_frames.to(device=self.device),
+                                cur_LQ_frame,
+                                clip_range=(-1, 1),
+                                chunk_size=None,
+                                method='adain'
+                            )
                 except:
                     pass
                 
@@ -475,7 +491,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
             
             frames = torch.cat(frames_total, dim=2)
             
-        return frames[0]
+        return frames if B > 1 else frames[0]
 
 
 # -----------------------------

@@ -1,3 +1,6 @@
+from typing import Literal
+
+
 from einops import rearrange, repeat
 
 import torch
@@ -42,7 +45,7 @@ class CausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
 
     def forward(self, x, cache_x=None):
-        padding = list(self._padding)
+        padding = list[Literal[0]](self._padding)
         if cache_x is not None and self._padding[4] > 0:
             cache_x = cache_x.to(x.device)
             # print('cache_x.shape', cache_x.shape, 'x.shape', x.shape)

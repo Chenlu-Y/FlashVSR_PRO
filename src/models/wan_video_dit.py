@@ -122,7 +122,6 @@ class WindowPartition3D:
 @torch.no_grad()
 def generate_draft_block_mask(batch_size, nheads, seqlen,
                               q_w, k_w, topk=10, local_attn_mask=None):
-    assert batch_size == 1, "Only batch_size=1 supported for now"
     assert local_attn_mask is not None, "local_attn_mask must be provided"
     avgpool_q = torch.mean(q_w, dim=1) 
     avgpool_k = torch.mean(k_w, dim=1)
@@ -134,8 +133,27 @@ def generate_draft_block_mask(batch_size, nheads, seqlen,
     scores = torch.einsum("hld,hmd->hlm", q_heads, k_heads) / math.sqrt(D)
 
     repeat_head = scores.shape[0]
-    repeat_len = scores.shape[1] // local_attn_mask.shape[0]
-    repeat_num = scores.shape[2] // local_attn_mask.shape[1]
+    s1, s2 = scores.shape[1], scores.shape[2]
+    repeat_len = s1 // local_attn_mask.shape[0]
+    repeat_num = s2 // local_attn_mask.shape[1]
+    # 若 (local_h, local_w) 与 (s1, s2) 不对齐（如 block_n!=block_n_kv 时网格顺序不同），先尝试转置
+    if repeat_len * local_attn_mask.shape[0] != s1 or repeat_num * local_attn_mask.shape[1] != s2:
+        local_attn_mask = local_attn_mask.t().contiguous()
+        repeat_len = s1 // local_attn_mask.shape[0]
+        repeat_num = s2 // local_attn_mask.shape[1]
+    if repeat_len * local_attn_mask.shape[0] != s1 or repeat_num * local_attn_mask.shape[1] != s2:
+        # 仍不对齐则用插值把 local_attn_mask 缩放到 (s1, s2)
+        local_attn_mask = (
+            F.interpolate(
+                local_attn_mask.unsqueeze(0).unsqueeze(0).float(),
+                size=(s1, s2),
+                mode="nearest",
+            )
+            .squeeze(0)
+            .squeeze(0)
+            .to(torch.bool)
+        )
+        repeat_len, repeat_num = 1, 1
     local_attn_mask = local_attn_mask.unsqueeze(1).unsqueeze(0).repeat(repeat_len, 1, repeat_num, 1)
     local_attn_mask = rearrange(local_attn_mask, 'x a y b -> (x a) (y b)')
     local_attn_mask = local_attn_mask.unsqueeze(0).repeat(repeat_head, 1, 1)
@@ -163,7 +181,6 @@ def generate_draft_block_mask(batch_size, nheads, seqlen,
 @torch.no_grad()
 def generate_draft_block_mask_sage(batch_size, nheads, seqlen,
                                       q_w, k_w, topk=10, local_attn_mask=None):
-    assert batch_size == 1, "Only batch_size=1 supported for now"
     assert local_attn_mask is not None, "local_attn_mask must be provided"
     
     avgpool_q = torch.mean(q_w, dim=1) 
@@ -183,17 +200,30 @@ def generate_draft_block_mask_sage(batch_size, nheads, seqlen,
     scores = torch.cat([scores_1, scores_2], dim=-1)
 
     repeat_head = scores.shape[0]
-    repeat_len = scores.shape[1] // local_attn_mask.shape[0]
-    repeat_num = (scores.shape[2] // 2) // local_attn_mask.shape[1]
-    
+    s1, s2 = scores.shape[1], scores.shape[2]  # s2 = block_n_kv * 2
+    s2_half = s2 // 2
+    repeat_len = s1 // local_attn_mask.shape[0]
+    repeat_num = s2_half // local_attn_mask.shape[1]
+    if repeat_len * local_attn_mask.shape[0] != s1 or repeat_num * local_attn_mask.shape[1] != s2_half:
+        local_attn_mask = local_attn_mask.t().contiguous()
+        repeat_len = s1 // local_attn_mask.shape[0]
+        repeat_num = s2_half // local_attn_mask.shape[1]
+    if repeat_len * local_attn_mask.shape[0] != s1 or repeat_num * local_attn_mask.shape[1] != s2_half:
+        local_attn_mask = (
+            F.interpolate(
+                local_attn_mask.unsqueeze(0).unsqueeze(0).float(),
+                size=(s1, s2_half),
+                mode="nearest",
+            )
+            .squeeze(0)
+            .squeeze(0)
+            .to(torch.bool)
+        )
+        repeat_len, repeat_num = 1, 1
     local_attn_mask = local_attn_mask.unsqueeze(1).unsqueeze(0).repeat(repeat_len, 1, repeat_num, 1)
     local_attn_mask = rearrange(local_attn_mask, 'x a y b -> (x a) (y b)')
     local_attn_mask = local_attn_mask.repeat_interleave(2, dim=1)
     local_attn_mask = local_attn_mask.unsqueeze(0).repeat(repeat_head, 1, 1)
-    
-    assert scores.shape == local_attn_mask.shape, \
-        f"Scores shape {scores.shape} != Mask shape {local_attn_mask.shape}"
-    
     local_attn_mask = local_attn_mask.to(torch.float32)
     local_attn_mask = local_attn_mask.masked_fill(local_attn_mask == False, -float('inf'))
     local_attn_mask = local_attn_mask.masked_fill(local_attn_mask == True, 0)
@@ -222,25 +252,57 @@ def generate_draft_block_mask_sage(batch_size, nheads, seqlen,
 # ----------------------------
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False, attention_mask=None, return_KV=False):
     if attention_mask is not None:
+        b_size = q.shape[0]
         seqlen = q.shape[1]
         seqlen_kv = k.shape[1]
         if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
             q = rearrange(q, "b s (n d) -> (b s) n d", n=num_heads)
             k = rearrange(k, "b s (n d) -> (b s) n d", n=num_heads)
             v = rearrange(v, "b s (n d) -> (b s) n d", n=num_heads)
+            # block_sparse_attn 期望 row_blockmask 形状 (batch_size, num_blocksparse_heads, nrow, ncol)，
+            # 其中 batch_size = 序列数 B（cu_seqlens_q 长度 - 1），不是 B*seqlen
+            if b_size > 1:
+                base_blockmask = attention_mask  # 已是 (B, num_heads, nrow, ncol)
+                cu_seqlens_q = torch.tensor(
+                    [i * seqlen for i in range(b_size + 1)],
+                    device=q.device,
+                    dtype=torch.int32,
+                )
+                cu_seqlens_k = torch.tensor(
+                    [i * seqlen_kv for i in range(b_size + 1)],
+                    device=q.device,
+                    dtype=torch.int32,
+                )
+            else:
+                base_blockmask = attention_mask
+                cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
+                cu_seqlens_k = torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32)
         else:
             q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
             k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
             v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
-        cu_seqlens_k = torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32)
+            base_blockmask = attention_mask
+            cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
+            cu_seqlens_k = torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32)
         head_mask_type = torch.tensor([1]*num_heads, device=q.device, dtype=torch.int32)
         streaming_info = None
-        base_blockmask = attention_mask
         max_seqlen_q_ = seqlen
         max_seqlen_k_ = seqlen_kv
         p_dropout = 0.0
         if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
+            # block_sparse_attn 要求 mask 后两维为 seqlen_q_rounded/128, seqlen_k_rounded/128
+            SPARSE_SIZE = 128
+            nrow_expected = (max_seqlen_q_ + SPARSE_SIZE - 1) // SPARSE_SIZE
+            ncol_expected = (max_seqlen_k_ + SPARSE_SIZE - 1) // SPARSE_SIZE
+            if base_blockmask.shape[2] != nrow_expected or base_blockmask.shape[3] != ncol_expected:
+                base_blockmask = (
+                    F.interpolate(
+                        base_blockmask.float(),
+                        size=(nrow_expected, ncol_expected),
+                        mode="nearest",
+                    )
+                    > 0.5
+                )
             x = block_sparse_attn_func(
                 q, k, v,
                 cu_seqlens_q, cu_seqlens_k,
@@ -254,7 +316,11 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
                 is_causal=False,
                 exact_streaming=False,
                 return_attn_probs=False,
-            ).unsqueeze(0)
+            )
+            if b_size > 1:
+                x = x.reshape(b_size, seqlen, num_heads, -1)
+            else:
+                x = x.unsqueeze(0)
             x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
         else:
             x = sparse_sageattn(
@@ -423,10 +489,22 @@ class SelfAttention(nn.Module):
             self.local_attn_mask_h = h//8
             self.local_attn_mask_w = w//8
             self.local_range = local_range
-        if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
-            attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
+        if B > 1:
+            masks = []
+            for b in range(B):
+                q_w_b = q_w[b * block_n:(b + 1) * block_n]
+                k_w_b = k_w[b * block_n_kv:(b + 1) * block_n_kv]
+                if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
+                    m = generate_draft_block_mask(1, self.num_heads, seqlen, q_w_b, k_w_b, topk=topk, local_attn_mask=self.local_attn_mask)
+                else:
+                    m = generate_draft_block_mask_sage(1, self.num_heads, seqlen, q_w_b, k_w_b, topk=topk, local_attn_mask=self.local_attn_mask)
+                masks.append(m)
+            attention_mask = torch.cat(masks, dim=0)
         else:
-            attention_mask = generate_draft_block_mask_sage(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
+            if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
+                attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
+            else:
+                attention_mask = generate_draft_block_mask_sage(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
 
         x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
 
@@ -438,6 +516,13 @@ class SelfAttention(nn.Module):
         else:
             cache_k = k_w
             cache_v = v_w
+
+        # B>1 时下一 block 会 cat(pre_cache_k, k_w)，要求总长为 B 的倍数；否则 rearrange 会报错
+        if is_stream and B > 1 and cache_k.shape[0] % B != 0:
+            pad_len = ((cache_k.shape[0] + B - 1) // B) * B - cache_k.shape[0]
+            device, dtype = cache_k.device, cache_k.dtype
+            cache_k = torch.cat([cache_k, torch.zeros(pad_len, cache_k.shape[1], cache_k.shape[2], device=device, dtype=dtype)], dim=0)
+            cache_v = torch.cat([cache_v, torch.zeros(pad_len, cache_v.shape[1], cache_v.shape[2], device=device, dtype=dtype)], dim=0)
 
         x = rearrange(x, 'b (block_n block_s) d -> (b block_n) (block_s) d', block_n=block_n, block_s=block_s)
         x = WindowPartition3D.reverse(x, win, (f, h, w))
