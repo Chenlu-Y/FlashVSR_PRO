@@ -70,6 +70,204 @@ def get_total_frame_count(input_path: str, enable_hdr: bool = False) -> int:
         raise RuntimeError(f"Input path does not exist: {input_path}")
 
 
+# ---------- 流式输入（按 tile，不加载整段 (N,H,W,C)）----------
+
+def get_segment_shape(
+    input_path: str, start_idx: int, end_idx: int, enable_hdr: bool = False
+) -> Tuple[int, int, int, int]:
+    """获取 segment 的 (N, H, W, C) 而不加载全部帧。用于流式输入时计算 tile 坐标。"""
+    N = end_idx - start_idx
+    if N <= 0:
+        raise RuntimeError(f"Invalid segment range: start_idx={start_idx}, end_idx={end_idx}")
+    if os.path.isfile(input_path):
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {input_path}")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret or frame is None:
+            raise RuntimeError(f"Could not read frame {start_idx} from {input_path}")
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w = frame_rgb.shape[0], frame_rgb.shape[1]
+        return N, h, w, 3
+    elif os.path.isdir(input_path):
+        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+        if enable_hdr:
+            image_extensions.add('.dpx')
+        image_files = []
+        for filename in os.listdir(input_path):
+            if any(filename.lower().endswith(ext) for ext in image_extensions):
+                image_files.append(filename)
+        image_files.sort(key=lambda x: natural_sort_key(x))
+        if start_idx >= len(image_files):
+            raise RuntimeError(f"Start index {start_idx} exceeds total frames {len(image_files)}")
+        N = min(N, len(image_files) - start_idx)
+        first_path = os.path.join(input_path, image_files[start_idx])
+        if first_path.lower().endswith('.dpx') and enable_hdr:
+            try:
+                from utils.io.hdr_io import read_dpx_frame
+                frame_np = read_dpx_frame(first_path)
+                h, w = frame_np.shape[0], frame_np.shape[1]
+                return N, h, w, 3
+            except Exception:
+                pass
+        img = cv2.imread(first_path)
+        if img is None:
+            raise RuntimeError(f"Could not read image {first_path}")
+        h, w = img.shape[0], img.shape[1]
+        return N, h, w, 3
+    else:
+        raise RuntimeError(f"Input path does not exist: {input_path}")
+
+
+def _read_single_frame(
+    input_path: str, frame_idx: int, enable_hdr: bool
+) -> torch.Tensor:
+    """读取单帧 (H,W,C) float。"""
+    if os.path.isfile(input_path):
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {input_path}")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret or frame is None:
+            raise RuntimeError(f"Could not read frame {frame_idx} from {input_path}")
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return torch.from_numpy(frame_rgb).float() / 255.0
+    elif os.path.isdir(input_path):
+        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+        if enable_hdr:
+            image_extensions.add('.dpx')
+        image_files = []
+        for filename in os.listdir(input_path):
+            if any(filename.lower().endswith(ext) for ext in image_extensions):
+                image_files.append(filename)
+        image_files.sort(key=lambda x: natural_sort_key(x))
+        if frame_idx >= len(image_files):
+            raise RuntimeError(f"Frame index {frame_idx} out of range")
+        path = os.path.join(input_path, image_files[frame_idx])
+        if path.lower().endswith('.dpx') and enable_hdr:
+            try:
+                from utils.io.hdr_io import read_dpx_frame
+                frame_np = read_dpx_frame(path)
+                return torch.from_numpy(frame_np).float()
+            except Exception:
+                pass
+        img = cv2.imread(path)
+        if img is None:
+            raise RuntimeError(f"Could not read {path}")
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return torch.from_numpy(img_rgb).float() / 255.0
+    else:
+        raise RuntimeError(f"Input path does not exist: {input_path}")
+
+
+def _apply_tone_mapping_single_frame(
+    frame: torch.Tensor, args, global_l_max: float
+) -> torch.Tensor:
+    """对单帧应用 tone mapping（用于流式 HDR）。"""
+    if not HDR_TONE_MAPPING_AVAILABLE:
+        return frame
+    from utils.hdr.tone_mapping import apply_tone_mapping_to_frames
+    batch = frame.unsqueeze(0)
+    out, _ = apply_tone_mapping_to_frames(
+        batch,
+        method=args.tone_mapping_method,
+        exposure=args.tone_mapping_exposure,
+        per_frame=False,
+        global_l_max=global_l_max,
+    )
+    return out[0]
+
+
+def get_hdr_tone_mapping_params_lightweight(
+    input_path: str, start_idx: int, end_idx: int, args, rank: int = 0,
+    sample_step: int = 10, checkpoint_dir: Optional[str] = None
+) -> Optional[dict]:
+    """流式 HDR：采样少量帧估计 global_l_max，避免整段加载。"""
+    if not getattr(args, "_enable_hdr", False) or not HDR_TONE_MAPPING_AVAILABLE:
+        return None
+    if getattr(args, "global_l_max", None) is not None:
+        g = args.global_l_max
+        return {
+            "global_l_max": g,
+            "method": getattr(args, "tone_mapping_method", "reinhard"),
+            "exposure": getattr(args, "tone_mapping_exposure", 1.0),
+            "max_hdr": g,
+            "white_point": g,
+        }
+    N = end_idx - start_idx
+    n_sample = min(20, max(1, N // sample_step))
+    step = max(1, N // n_sample) if n_sample else 1
+    indices = [start_idx + i * step for i in range(n_sample) if start_idx + i * step < end_idx]
+    if not indices:
+        indices = [start_idx]
+    frames_list = []
+    for i in indices:
+        frames_list.append(_read_single_frame(input_path, i, enable_hdr=True))
+    stack = torch.stack(frames_list, dim=0)
+    if not detect_hdr_range(stack):
+        return None
+    global_l_max = stack.max().item() * getattr(args, "tone_mapping_exposure", 1.0)
+    log(f"[Rank {rank}] [HDR] 流式: 采样 {len(indices)} 帧估计 global_l_max={global_l_max:.4f}", "info", rank)
+    method = getattr(args, "tone_mapping_method", "reinhard")
+    exposure = getattr(args, "tone_mapping_exposure", 1.0)
+    params = {
+        "global_l_max": global_l_max,
+        "method": method,
+        "exposure": exposure,
+        "max_hdr": global_l_max,
+        "white_point": global_l_max,
+    }
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        params_file = os.path.join(checkpoint_dir, f"rank_{rank}_streaming_hdr_params.json")
+        with open(params_file, "w") as fp:
+            json.dump(params, fp, indent=2)
+    return params
+
+
+def read_input_frames_range_tile_crops(
+    input_path: str,
+    start_idx: int,
+    end_idx: int,
+    tile_coords: List[Tuple[int, int, int, int]],
+    fps: float = 30.0,
+    enable_hdr: bool = False,
+    streaming_hdr_params: Optional[dict] = None,
+    args=None,
+) -> Tuple[List[torch.Tensor], float]:
+    """流式按 tile 读取：逐帧读入并裁成多个 tile 的 (N,tile_h,tile_w,C)，不保留整幅 (N,H,W,C)。"""
+    N = end_idx - start_idx
+    if N <= 0:
+        raise RuntimeError(f"Invalid segment range: {start_idx}-{end_idx}")
+    global_l_max = None
+    if streaming_hdr_params and isinstance(streaming_hdr_params, dict):
+        global_l_max = streaming_hdr_params.get("global_l_max")
+    if args is None:
+        class _DummyArgs:
+            tone_mapping_method = "reinhard"
+            tone_mapping_exposure = 1.0
+        args = _DummyArgs()
+
+    tile_tensors = []
+    for (x1, y1, x2, y2) in tile_coords:
+        th, tw = y2 - y1, x2 - x1
+        tile_tensors.append(torch.empty((N, th, tw, 3), dtype=torch.float32))
+
+    for local_i in range(N):
+        frame_idx = start_idx + local_i
+        frame = _read_single_frame(input_path, frame_idx, enable_hdr=enable_hdr)
+        if enable_hdr and global_l_max is not None and frame.max().item() > 1.05:
+            frame = _apply_tone_mapping_single_frame(frame, args, global_l_max)
+        for t_idx, (x1, y1, x2, y2) in enumerate(tile_coords):
+            tile_tensors[t_idx][local_i] = frame[y1:y2, x1:x2, :].clone()
+        del frame
+    return tile_tensors, fps
+
+
 def read_input_frames_range(
     input_path: str, start_idx: int, end_idx: int, fps: float = 30.0, enable_hdr: bool = False
 ) -> Tuple[torch.Tensor, float]:
@@ -347,7 +545,12 @@ def apply_inverse_hdr_if_needed(output: torch.Tensor, tone_mapping_params, args,
     log(f"[Rank {rank}] [HDR] 应用 Inverse Tone Mapping 还原 HDR...", "info", rank)
     if output.min() < 0:
         output = (output + 1.0) / 2.0
-    output = apply_inverse_tone_mapping_to_frames(output, tone_mapping_params)
+    # 流式时 tone_mapping_params 为单段 dict，需展开为每帧一份
+    if isinstance(tone_mapping_params, dict):
+        params_list = [tone_mapping_params] * output.shape[0]
+    else:
+        params_list = tone_mapping_params
+    output = apply_inverse_tone_mapping_to_frames(output, params_list)
     log(f"[Rank {rank}] [HDR] HDR 还原完成，范围: [{output.min():.4f}, {output.max():.4f}]", "info", rank)
     return output
 
