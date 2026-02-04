@@ -2,19 +2,20 @@
 """无损/高质量图片批量压缩工具
 
 支持指定源文件夹、缩放比例，输出为无损 PNG 或高质量 JPEG，保留细节（Lanczos 重采样）。
+输出与输入保持一致的相对路径和文件名（默认连扩展名一致；也可用 --format 统一为 png/jpg）。
 
 使用方法：
     python compress_images.py --input_dir /path/to/images --output_dir /path/output --scale 0.5
     python compress_images.py -i ./photos -o ./compressed -s 0.5 --format png
 
 示例：
-    # 当前目录图片压缩到 50%，输出到 hq_compressed_all
+    # 当前目录图片压缩到 50%，输出到 hq_compressed_all（输出文件名与输入一致）
     python compress_images.py -i . -o hq_compressed_all -s 0.5
 
-    # 指定文件夹，压缩到 30% 尺寸，PNG 无损
+    # 指定文件夹，压缩到 30% 尺寸，PNG 无损，输出主名与输入一致、扩展名统一为 .png
     python compress_images.py -i /data/frames -o /data/frames_small -s 0.3 --format png
 
-    # 输出为高质量 JPEG（quality=95，视觉上接近无损）
+    # 输出为高质量 JPEG（quality=95），输出主名与输入一致、扩展名统一为 .jpg
     python compress_images.py -i ./imgs -o ./out -s 0.5 --format jpg --quality 95
 """
 
@@ -32,6 +33,15 @@ except ImportError:
 
 # 支持的图片格式
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff', '.tif'}
+
+# 根据扩展名返回可写入的格式（png/jpg）；仅 .png/.jpg/.jpeg 保持原扩展名
+def _format_for_extension(suffix: str) -> str:
+    suf = (suffix or "").lower()
+    if suf in ('.jpg', '.jpeg'):
+        return 'jpg'
+    if suf == '.png':
+        return 'png'
+    return 'png'
 
 
 def find_image_files(input_dir: Path) -> List[Path]:
@@ -139,6 +149,11 @@ def main():
         action="store_true",
         help="若输出文件已存在则跳过",
     )
+    parser.add_argument(
+        "--keep_extension",
+        action="store_true",
+        help="输出文件名与输入完全一致（含扩展名），按输入文件格式编码；未指定时仅主名一致、扩展名由 --format 决定",
+    )
     args = parser.parse_args()
 
     input_dir = args.input_dir.resolve()
@@ -164,20 +179,33 @@ def main():
     total = len(files)
     print(f"找到 {total} 张图片。源目录: {input_dir}")
     print(f"输出目录: {output_dir}，缩放比例: {args.scale}，格式: {args.format}")
+    if args.keep_extension:
+        print("输出文件名与输入完全一致（含扩展名），按输入格式编码")
+    else:
+        print("输出主名与输入一致，扩展名由 --format 决定")
     if args.format == "png":
         print(f"PNG 压缩级别: {args.png_compression}（无损）")
     else:
         print(f"JPEG 质量: {args.quality}")
     print("可随时按 Ctrl+C 停止。\n")
 
-    ext = ".jpg" if args.format in ("jpg", "jpeg") else ".png"
+    default_ext = ".jpg" if args.format in ("jpg", "jpeg") else ".png"
     ok = 0
     for i, src in enumerate(files, 1):
         try:
             rel = src.relative_to(input_dir)
         except ValueError:
             rel = Path(src.name)
-        dst = output_dir / rel.parent / (src.stem + ext)
+        if args.keep_extension:
+            out_format = _format_for_extension(src.suffix)
+            # 仅当可编码为同格式时保持扩展名一致；否则主名一致、输出为 .png
+            if (src.suffix or "").lower() in ('.png', '.jpg', '.jpeg'):
+                dst = output_dir / rel
+            else:
+                dst = output_dir / rel.parent / (src.stem + ".png")
+        else:
+            dst = output_dir / rel.parent / (src.stem + default_ext)
+            out_format = args.format
 
         if args.skip_existing and dst.exists():
             print(f"[{i}/{total}] 跳过（已存在）: {src.name}")
@@ -189,7 +217,7 @@ def main():
             src,
             dst,
             scale=args.scale,
-            out_format=args.format,
+            out_format=out_format,
             png_compression=args.png_compression,
             jpg_quality=args.quality,
         )

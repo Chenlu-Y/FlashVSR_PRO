@@ -471,8 +471,11 @@ class SelfAttention(nn.Module):
         seqlen = f//win[0]
         one_len = k_w.shape[0] // B // seqlen
         if pre_cache_k is not None and pre_cache_v is not None:
-            k_w = torch.cat([pre_cache_k, k_w], dim=0)
-            v_w = torch.cat([pre_cache_v, v_w], dim=0)
+            # 多 batch 时保证 cat 前后张量连续，避免 view 时 Batch 维错位（多 GPU 多 batch 乱码）
+            k_w = torch.cat([pre_cache_k.contiguous(), k_w.contiguous()], dim=0)
+            v_w = torch.cat([pre_cache_v.contiguous(), v_w.contiguous()], dim=0)
+        k_w = k_w.contiguous()
+        v_w = v_w.contiguous()
 
         block_n = q_w.shape[0] // B
         block_s = q_w.shape[1]
@@ -508,21 +511,33 @@ class SelfAttention(nn.Module):
 
         x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
 
-        cur_block_n, cur_block_s, _ = k_w.shape
-        cache_num = cur_block_n // one_len
-        if cache_num > kv_len:
-            cache_k = k_w[one_len:, :, :]
-            cache_v = v_w[one_len:, :, :]
-        else:
-            cache_k = k_w
-            cache_v = v_w
+        # ===== batch-safe cache update =====
+        cur_block_n, cur_block_s, _ = k_w.shape  # cur_block_n == B * block_n_kv
+        D = k_w.shape[-1]
 
-        # B>1 时下一 block 会 cat(pre_cache_k, k_w)，要求总长为 B 的倍数；否则 rearrange 会报错
-        if is_stream and B > 1 and cache_k.shape[0] % B != 0:
-            pad_len = ((cache_k.shape[0] + B - 1) // B) * B - cache_k.shape[0]
-            device, dtype = cache_k.device, cache_k.dtype
-            cache_k = torch.cat([cache_k, torch.zeros(pad_len, cache_k.shape[1], cache_k.shape[2], device=device, dtype=dtype)], dim=0)
-            cache_v = torch.cat([cache_v, torch.zeros(pad_len, cache_v.shape[1], cache_v.shape[2], device=device, dtype=dtype)], dim=0)
+        # block_n_kv 是“每个样本”的 block 数
+        # 你前面已经算过：block_n_kv = k_w.shape[0] // B
+        # one_len 也是“每个样本”维度下的单位长度
+        # 所以 cache_num 应该只在 per-sample 语义下计算，不能乘上 B
+        cache_num = block_n_kv // one_len  # ✅ 不随 B 变化（通常就是 seqlen）
+
+        # 先 reshape 成 (B, block_n_kv, block_s, D)，确保后续裁剪是“每个样本独立裁剪”
+        k_w_b = k_w.view(B, block_n_kv, cur_block_s, D)
+        v_w_b = v_w.view(B, block_n_kv, cur_block_s, D)
+
+        if kv_len is not None and cache_num > kv_len:
+            # ✅ 每个样本都裁掉最旧的 one_len，而不是对整个大张量做 [one_len:]
+            k_keep = k_w_b[:, one_len:, :, :]
+            v_keep = v_w_b[:, one_len:, :, :]
+        else:
+            k_keep = k_w_b
+            v_keep = v_w_b
+
+        # 再 flatten 回 (B * keep_len, block_s, D)，保证连续以便下一轮 cat/view 不错位
+        cache_k = k_keep.reshape(-1, cur_block_s, D).contiguous()
+        cache_v = v_keep.reshape(-1, cur_block_s, D).contiguous()
+
+        # ✅ 不再需要 “pad 到 B 的倍数” 的 hack（因为我们保证了 per-sample 裁剪后天然可整除）
 
         x = rearrange(x, 'b (block_n block_s) d -> (b block_n) (block_s) d', block_n=block_n, block_s=block_s)
         x = WindowPartition3D.reverse(x, win, (f, h, w))

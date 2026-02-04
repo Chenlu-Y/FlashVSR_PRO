@@ -609,6 +609,8 @@ if __name__ == "__main__":
                         help="Clean up memory-mapped canvas files after saving results")
     parser.add_argument("--tile_batch_size", type=int, default=0,
                         help="Number of tiles to process simultaneously (0 = auto-detect)")
+    parser.add_argument("--allow_tile_batch_multigpu", action="store_true",
+                        help="Allow tile_batch_size>1 when using --devices all (may cause visual artifacts; default: disabled)")
     parser.add_argument("--adaptive_tile_batch", type=lambda x: x.lower() in ['true', '1', 'yes'], default=True,
                         help="Enable adaptive tile batch size based on available GPU memory")
     

@@ -12,7 +12,7 @@ import gc
 import shutil
 import tempfile
 import subprocess
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Sequence
 
 import numpy as np
 import cv2
@@ -68,6 +68,23 @@ def get_total_frame_count(input_path: str, enable_hdr: bool = False) -> int:
         return len(image_files)
     else:
         raise RuntimeError(f"Input path does not exist: {input_path}")
+
+
+def get_input_image_sequence_filenames(input_path: str, enable_hdr: bool = False) -> Optional[List[str]]:
+    """当输入为图片序列目录时，返回按自然序排序的文件名列表；否则返回 None。"""
+    if not os.path.isdir(input_path):
+        return None
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+    if enable_hdr:
+        image_extensions.add('.dpx')
+    image_files = []
+    for filename in os.listdir(input_path):
+        if any(filename.lower().endswith(ext) for ext in image_extensions):
+            image_files.append(filename)
+    if not image_files:
+        return None
+    image_files.sort(key=lambda x: natural_sort_key(x))
+    return image_files
 
 
 def read_input_frames_range(
@@ -432,12 +449,28 @@ def get_global_hdr_max(
 #                    输出保存
 # ==============================================================
 
+def _output_filename_for_frame(
+    logical_idx: int,
+    output_path: str,
+    output_format: str,
+    input_filenames: Optional[Sequence[str]] = None,
+) -> str:
+    """根据逻辑帧索引生成输出文件名；若提供 input_filenames 则保持与输入名称一致（仅扩展名按输出格式）。"""
+    if input_filenames is not None and 0 <= logical_idx < len(input_filenames):
+        base, _ = os.path.splitext(input_filenames[logical_idx])
+        ext = ".dpx" if output_format in ("dpx", "dpx10") else ".png"
+        return os.path.join(output_path, base + ext)
+    ext = ".dpx" if output_format in ("dpx", "dpx10") else ".png"
+    return os.path.join(output_path, f"frame_{logical_idx:06d}" + ext)
+
+
 def save_frames_as_sequence(
     output: torch.Tensor, output_path: str, args,
     rank: int = 0, start_frame_idx: int = 0,
     global_hdr_max: float = None,
+    input_filenames: Optional[Sequence[str]] = None,
 ) -> int:
-    """将帧保存为图片序列（PNG 或 DPX10）。"""
+    """将帧保存为图片序列（PNG 或 DPX10）。若提供 input_filenames（图片序列输入），输出文件名与输入一致（仅扩展名按 output_format）。"""
     os.makedirs(output_path, exist_ok=True)
     output_format = getattr(args, 'output_format', 'png')
     is_hdr = getattr(args, '_enable_hdr', False) and (output > 1.0).any().item()
@@ -451,7 +484,8 @@ def save_frames_as_sequence(
         apply_srgb_gamma = not use_hlg_workflow
         for frame_idx in range(output.shape[0]):
             frame = output[frame_idx].cpu().numpy()
-            frame_filename = os.path.join(output_path, f"frame_{start_frame_idx + frame_idx:06d}.dpx")
+            logical_idx = start_frame_idx + frame_idx
+            frame_filename = _output_filename_for_frame(logical_idx, output_path, output_format, input_filenames)
             save_frame_as_dpx10(frame, frame_filename, hdr_max=global_hdr_max, apply_srgb_gamma=apply_srgb_gamma)
             frames_saved += 1
     else:
@@ -459,7 +493,8 @@ def save_frames_as_sequence(
             log(f"[Rank {rank}] [HDR] 输出包含 HDR 值，PNG 输出会 clip 到 [0,1]", "warning", rank)
         output_np = (output.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
         for frame_idx in range(output_np.shape[0]):
-            frame_filename = os.path.join(output_path, f"frame_{start_frame_idx + frame_idx:06d}.png")
+            logical_idx = start_frame_idx + frame_idx
+            frame_filename = _output_filename_for_frame(logical_idx, output_path, output_format, input_filenames)
             cv2.imwrite(frame_filename, cv2.cvtColor(output_np[frame_idx], cv2.COLOR_RGB2BGR))
         frames_saved = output_np.shape[0]
 
@@ -560,6 +595,9 @@ def merge_and_save_distributed_results(checkpoint_dir, args, world_size, total_f
     if output_mode == "pictures":
         os.makedirs(output_path, exist_ok=True)
         output_format = getattr(args, 'output_format', 'png')
+        input_filenames = get_input_image_sequence_filenames(
+            args.input, enable_hdr=getattr(args, '_enable_hdr', False)
+        )
         total_frames_written = 0
         for idx, (r, result_file, mb) in enumerate(result_files):
             log(f"[Rank 0] Merge progress: loading rank {r} ({idx + 1}/{len(result_files)}), ~{mb:.0f} MB...", "info", rank)
@@ -569,13 +607,17 @@ def merge_and_save_distributed_results(checkpoint_dir, args, world_size, total_f
                 global_hdr_max = getattr(args, 'global_l_max', None)
                 for i in range(segment.shape[0]):
                     frame = segment[i].cpu().numpy()
-                    frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.dpx")
+                    frame_filename = _output_filename_for_frame(
+                        total_frames_written, output_path, output_format, input_filenames
+                    )
                     save_frame_as_dpx10(frame, frame_filename, hdr_max=global_hdr_max, apply_srgb_gamma=False)
                     total_frames_written += 1
             else:
                 seg_np = (segment.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
                 for i in range(seg_np.shape[0]):
-                    frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.png")
+                    frame_filename = _output_filename_for_frame(
+                        total_frames_written, output_path, output_format, input_filenames
+                    )
                     cv2.imwrite(frame_filename, cv2.cvtColor(seg_np[i], cv2.COLOR_RGB2BGR))
                     total_frames_written += 1
             del segment

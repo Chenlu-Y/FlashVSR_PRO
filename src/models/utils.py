@@ -367,6 +367,8 @@ class Buffer_LQ4x_Proj(nn.Module):
         self.clip_idx = 0
         
     def stream_forward(self, video_clip):
+        # 多 batch 时保证时序维 cat 不错位（多 GPU 多 batch 乱码排查）
+        video_clip = video_clip.contiguous()
         if self.clip_idx == 0:
             # self.clear_cache()
             first_frame = video_clip[:, :, :1, :, :].repeat(1, 1, 3, 1, 1)

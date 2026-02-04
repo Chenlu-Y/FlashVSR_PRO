@@ -348,6 +348,10 @@ class FlashVSRTinyLongPipeline(BasePipeline):
             num_frames = (num_frames + 2) // 4 * 4 + 1
             print(f"Only `num_frames % 4 != 1` is acceptable. We round it up to {num_frames}.")
 
+        # 强制 LQ 内存连续，防止多 batch 时 view/cat 导致 Batch 维错位（多 GPU 多 batch 乱码）
+        if LQ_video is not None:
+            LQ_video = LQ_video.contiguous()
+
         # Batch 维：支持 batched tile 推理（B > 1）
         B = LQ_video.shape[0] if LQ_video is not None else 1
 

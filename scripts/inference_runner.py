@@ -84,7 +84,9 @@ def determine_optimal_batch_size(
     args,
     rank: int = 0,
 ) -> int:
-    """Determine optimal batch size based on available GPU memory."""
+    """Determine optimal batch size based on available GPU memory.
+    多 GPU 时实际推理为逐 tile(B=1)，tile_batch_size 仅作进度分组；单 GPU 时仍可 batched 加速。
+    """
     if hasattr(args, "tile_batch_size") and args.tile_batch_size > 0:
         batch_size = args.tile_batch_size
         log(
@@ -396,6 +398,10 @@ def _process_tile_batch_distributed_single(
             continue
         with torch.no_grad():
             try:
+                # ===== 验证：pipe 前清 cache + 同步 =====
+                pipe.denoising_model().LQ_proj_in.clear_cache()
+                torch.cuda.synchronize()
+
                 output_tile = pipe(
                     prompt="",
                     negative_prompt="",
@@ -415,6 +421,11 @@ def _process_tile_batch_distributed_single(
                     color_fix=args.color_fix,
                     unload_dit=args.unload_dit,
                 )
+
+                # ===== 验证：pipe 后清 cache + 同步 =====
+                pipe.denoising_model().LQ_proj_in.clear_cache()
+                torch.cuda.synchronize()
+                
             except ValueError as e:
                 if "expected a non-empty list" in str(e):
                     log(
@@ -462,8 +473,27 @@ def process_tile_batch_distributed(
     batch_idx: int,
     rank: int,
 ):
-    """处理一批 tiles，返回 coords/tile/mask 列表。B>1 时一次 pipe 调用，否则或失败时逐 tile 调用。"""
+    """处理一批 tiles，返回 coords/tile/mask 列表。B>1 时一次 pipe 调用，否则或失败时逐 tile 调用。
+    多 GPU + 多 tile 时默认强制逐 tile(B=1) 避免乱码；传 --allow_tile_batch_multigpu 时则允许多 tile 批处理。
+    """
     N, H, W, C = frames.shape
+    world_size = getattr(args, "world_size", 1)
+    allow_multi = getattr(args, "allow_tile_batch_multigpu", False)
+    if world_size > 1 and len(tile_batch) > 1 and not allow_multi:
+        if batch_idx == 0:
+            log(
+                f"[Rank {rank}] Multi-GPU + tile_batch>1 易乱码，本 rank 改为逐 tile 调 pipe(B=1)（与多 GPU 单 tile 同路径）",
+                "info",
+                rank,
+            )
+        out = []
+        for one_coord in tile_batch:
+            part = _process_tile_batch_distributed_single(
+                pipe, frames, device, dtype, args, [one_coord], batch_idx, rank
+            )
+            out.extend(part)
+        return out
+
     if len(tile_batch) <= 1:
         return _process_tile_batch_distributed_single(
             pipe, frames, device, dtype, args, tile_batch, batch_idx, rank
@@ -533,14 +563,21 @@ def process_tile_batch_distributed(
             "info",
             rank,
         )
+    # 每个 (rank, batch_idx) 使用不同 seed，避免多 batch 重复同一噪声导致条纹/周期伪影
+    base_seed = getattr(args, "seed", None) or 0
+    batch_seed = base_seed + rank * 10000 + batch_idx * 100
     with torch.no_grad():
         try:
+            # ===== 验证：pipe 前清 cache + 同步 =====
+            pipe.denoising_model().LQ_proj_in.clear_cache()
+            torch.cuda.synchronize()
+
             output_batched = pipe(
                 prompt="",
                 negative_prompt="",
                 cfg_scale=1.0,
                 num_inference_steps=1,
-                seed=args.seed,
+                seed=batch_seed,
                 tiled=args.tiled_vae,
                 LQ_video=batched_LQ,
                 num_frames=max_F,
@@ -554,6 +591,10 @@ def process_tile_batch_distributed(
                 color_fix=args.color_fix,
                 unload_dit=args.unload_dit,
             )
+            # ===== 验证：pipe 后清 cache + 同步 =====
+            pipe.denoising_model().LQ_proj_in.clear_cache()
+            torch.cuda.synchronize()
+
         except (RuntimeError, ValueError) as e:
             log(
                 f"[Rank {rank}] Batched pipe failed ({e}), falling back to single-tile processing.",
@@ -623,6 +664,8 @@ def _run_tiled_inference_one_pass(
 ):
     """跑一遍 tiled 推理并累积到 canvas/weight_canvas，返回 (canvas, weight_canvas)。
     checkpoint_dir 为 None 时不使用 mmap 与断点续跑（用于 tile_shift 双遍时的每一遍）。
+    多 GPU 时强制用内存 canvas：与单 GPU 一致（单 GPU 传 checkpoint_dir=None 故用内存），
+    避免 memmap + batched 累加时的视图/写入顺序导致乱码。
     """
     processed_tiles_file = (
         os.path.join(checkpoint_dir, f"rank_{rank}_processed_tiles.json")
@@ -642,7 +685,16 @@ def _run_tiled_inference_one_pass(
         except Exception:
             pass
 
-    use_mmap = checkpoint_dir is not None
+    # 单 GPU 时 run_inference_distributed_segment 传 checkpoint_dir=None → 用内存；多 GPU 时传了 checkpoint_dir 会走 mmap。
+    # 多 GPU + batched tile 时 memmap 上的 in-place 累加易出乱码，故多 GPU 也改用内存 canvas，与单 GPU 行为一致。
+    world_size = getattr(args, "world_size", 1)
+    use_mmap = checkpoint_dir is not None and world_size <= 1
+    if checkpoint_dir and world_size > 1:
+        log(
+            f"[Rank {rank}] Multi-GPU: using in-memory canvas (same as single-GPU) to avoid mmap batched-write artifacts",
+            "info",
+            rank,
+        )
     canvas = None
     weight_canvas = None
     canvas_mmap = None
@@ -1112,6 +1164,9 @@ def run_single_gpu_inference(args, total_frames: int, input_fps: float, device_i
         global_hdr_max = inference_io.get_global_hdr_max(
             output, args, checkpoint_dir, rank_list=[0]
         )
+        input_filenames = inference_io.get_input_image_sequence_filenames(
+            args.input, enable_hdr=enable_hdr
+        )
         frames_saved = inference_io.save_frames_as_sequence(
             output,
             output_path,
@@ -1119,6 +1174,7 @@ def run_single_gpu_inference(args, total_frames: int, input_fps: float, device_i
             rank=0,
             start_frame_idx=0,
             global_hdr_max=global_hdr_max,
+            input_filenames=input_filenames,
         )
         log(f"[Single-GPU] ✓ Saved {frames_saved} frames to {output_path}", "finish")
     else:
@@ -1142,7 +1198,14 @@ def run_distributed_inference(
     input_fps: float,
     device_id: int = None,
 ):
-    """多 GPU 分布式推理入口。I/O、HDR、合并保存由 utils.io.inference_io 提供。"""
+    """多 GPU 分布式推理入口。I/O、HDR、合并保存由 utils.io.inference_io 提供。
+
+    流程简述（devices all 时）：
+    1) 按时间切段：视频帧按 segment 分给各 GPU（rank 0 拿 [0, N0]，rank 1 拿 [N0-overlap, N1]，…）
+    2) 每 GPU 只处理自己的 segment_frames，在空间上再按 tile 切块
+    3) tile_batch_size：每个 GPU 上每次可同时推理的 tile 个数（batch 维拼在一起一次 pipe 调用）
+    4) 多 GPU + tile_batch_size>1 已通过 DiT 内 B>1 时 KV cache 用重复块填充修复，可正常使用
+    """
     if device_id is None:
         device_id = rank
     os.environ["MASTER_ADDR"] = args.master_addr
@@ -1184,6 +1247,7 @@ def run_distributed_inference(
             device_id=device_id,
         )
         device = ensure_device_str(device_obj)
+        args.world_size = world_size  # 供 determine_optimal_batch_size 判断多 GPU 时是否限制 tile_batch
         segment_overlap = getattr(args, "segment_overlap", 2)
         segments = inference_io.split_video_by_frames(
             total_frames, world_size, overlap=segment_overlap, force_num_workers=False

@@ -348,6 +348,10 @@ class FlashVSRTinyPipeline(BasePipeline):
             num_frames = (num_frames + 2) // 4 * 4 + 1
             print(f"Only `num_frames % 4 != 1` is acceptable. We round it up to {num_frames}.")
 
+        # 强制 LQ 内存连续，防止多 batch 时 view/cat 导致 Batch 维错位（多 GPU 多 batch 乱码）
+        if LQ_video is not None:
+            LQ_video = LQ_video.contiguous()
+
         # Batch 维：支持 batched tile 推理（B > 1）
         B = LQ_video.shape[0] if LQ_video is not None else 1
 
@@ -573,6 +577,13 @@ def model_fn_wan_video(
 ):
     # patchify
     x, (f, h, w) = dit.patchify(x)
+    B = x.shape[0]
+    # 多 GPU 多 batch 排查：设置 FLASHVSR_DEBUG_MULTIBATCH=1 时打印 shape，检查 batch 与 KV 对齐
+    if os.environ.get("FLASHVSR_DEBUG_MULTIBATCH") and B > 1:
+        pk0 = pre_cache_k[0] if (pre_cache_k is not None and len(pre_cache_k) > 0) else None
+        print(f"[FLASHVSR_DEBUG_MULTIBATCH] cur_process_idx={cur_process_idx} B={B} x.shape={tuple(x.shape)} pre_cache_k[0].shape={tuple(pk0.shape) if pk0 is not None else None}")
+        if pk0 is not None and pk0.shape[0] % B != 0:
+            print(f"[FLASHVSR_DEBUG_MULTIBATCH] WARNING: pre_cache_k[0].shape[0]={pk0.shape[0]} not divisible by B={B} -> possible batch misalign")
 
     win = (2, 8, 8)
     seqlen = f // win[0]
