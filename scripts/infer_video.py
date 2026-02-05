@@ -612,6 +612,8 @@ if __name__ == "__main__":
     parser.set_defaults(resume=True)
     
     # -------------------- 内存优化参数 --------------------
+    parser.add_argument("--streaming_input", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False,
+                        help="Stream input by tile (no full segment in RAM); requires tiled_dit, disables tile_shift")
     parser.add_argument("--cleanup_mmap", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False,
                         help="Clean up memory-mapped canvas files after saving results")
     parser.add_argument("--tile_batch_size", type=int, default=0,

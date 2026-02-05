@@ -83,9 +83,11 @@ def determine_optimal_batch_size(
     frames: torch.Tensor,
     args,
     rank: int = 0,
+    segment_n_frames: int = None,
 ) -> int:
     """Determine optimal batch size based on available GPU memory.
     多 GPU 时实际推理为逐 tile(B=1)，tile_batch_size 仅作进度分组；单 GPU 时仍可 batched 加速。
+    When frames is None (streaming), pass segment_n_frames.
     """
     if hasattr(args, "tile_batch_size") and args.tile_batch_size > 0:
         batch_size = args.tile_batch_size
@@ -107,7 +109,7 @@ def determine_optimal_batch_size(
     try:
         available_gb = get_available_memory_gb(device)
         used_gb, total_gb = get_gpu_memory_info(device)
-        N = frames.shape[0]
+        N = segment_n_frames if segment_n_frames is not None else (frames.shape[0] if frames is not None else 1)
 
         tile_size = args.tile_size
         dtype_size = 2 if args.precision in ["fp16", "bf16"] else 4
@@ -648,6 +650,235 @@ def process_tile_batch_distributed(
     return results
 
 
+def _process_tile_batch_distributed_single_with_crops(
+    pipe,
+    tile_tensors: List[torch.Tensor],
+    tile_batch: List[Tuple[int, int, int, int]],
+    device,
+    dtype,
+    args,
+    batch_idx: int,
+    rank: int,
+):
+    """逐 tile 调用 pipe，输入为已裁好的 tile 张量列表（流式用）。tile_tensors[i] 对应 tile_batch[i]，形状 (N, tile_h, tile_w, C)。"""
+    results = []
+    for tile_idx, (x1, y1, x2, y2) in enumerate(tile_batch):
+        input_tile = tile_tensors[tile_idx]
+        N_tile = input_tile.shape[0]
+        LQ_tile, th, tw, F, N0_tile = prepare_input_tensor(
+            input_tile, device, scale=args.scale, dtype=dtype
+        )
+        if "long" not in args.mode:
+            LQ_tile = LQ_tile.to(device)
+        topk_ratio = args.sparse_ratio * 768 * 1280 / (th * tw)
+        if F < 17:
+            log(
+                f"[Rank {rank}] WARNING: Tile has only {F} frames, minimum is 17. Skipping this tile.",
+                "warning",
+                rank,
+            )
+            placeholder = input_tile[-1:].repeat(N0_tile, 1, 1, 1)
+            results.append({
+                "coords": (x1, y1, x2, y2),
+                "tile": placeholder,
+                "mask": torch.ones(1, placeholder.shape[1], placeholder.shape[2], 1),
+            })
+            continue
+        with torch.no_grad():
+            try:
+                output_tile = pipe(
+                    prompt="",
+                    negative_prompt="",
+                    cfg_scale=1.0,
+                    num_inference_steps=1,
+                    seed=args.seed,
+                    tiled=args.tiled_vae,
+                    LQ_video=LQ_tile,
+                    num_frames=F,
+                    height=th,
+                    width=tw,
+                    is_full_block=False,
+                    if_buffer=True,
+                    topk_ratio=topk_ratio,
+                    kv_ratio=args.kv_ratio,
+                    local_range=args.local_range,
+                    color_fix=args.color_fix,
+                    unload_dit=args.unload_dit,
+                )
+            except ValueError as e:
+                if "expected a non-empty list" in str(e):
+                    log(
+                        f"[Rank {rank}] ERROR: Pipeline returned empty latents. Tile coords=({x1},{y1})-({x2},{y2}), th={th}, tw={tw}, F={F}",
+                        "error",
+                        rank,
+                    )
+                    raise RuntimeError(
+                        f"Pipeline failed: empty latents. Tile may be too small or have insufficient frames (F={F}, min=17)"
+                    ) from e
+                raise
+        if isinstance(output_tile, (tuple, list)):
+            output_tile = output_tile[0]
+        processed_tile_cpu = tensor2video(output_tile).to("cpu")
+        if processed_tile_cpu.shape[0] < N0_tile:
+            raise RuntimeError(
+                f"[Rank {rank}] ERROR: Pipeline returned only {processed_tile_cpu.shape[0]} frames, need {N0_tile}."
+            )
+        if processed_tile_cpu.shape[0] > N0_tile:
+            processed_tile_cpu = processed_tile_cpu[:N0_tile]
+        sH, sW = (y2 - y1) * args.scale, (x2 - x1) * args.scale
+        th_out, tw_out = processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]
+        if th_out > sH or tw_out > sW:
+            processed_tile_cpu = processed_tile_cpu[:, :sH, :sW, :]
+        mask_nchw = create_feather_mask((th_out, tw_out), args.tile_overlap).to("cpu")
+        mask_nchw = mask_nchw[:, :, :sH, :sW]
+        mask_nhwc = mask_nchw.permute(0, 2, 3, 1).expand(
+            processed_tile_cpu.shape[0], -1, -1, -1
+        )
+        results.append(
+            {"coords": (x1, y1, x2, y2), "tile": processed_tile_cpu, "mask": mask_nhwc}
+        )
+        del LQ_tile, output_tile, processed_tile_cpu, input_tile
+        clean_vram()
+    return results
+
+
+def process_tile_batch_distributed_with_crops(
+    pipe,
+    tile_tensors: List[torch.Tensor],
+    device,
+    dtype,
+    args,
+    tile_batch: List[Tuple[int, int, int, int]],
+    batch_idx: int,
+    rank: int,
+):
+    """处理一批 tiles，输入为已裁好的 tile 张量列表（流式用）。tile_tensors[i] 对应 tile_batch[i]。"""
+    if len(tile_batch) <= 1:
+        return _process_tile_batch_distributed_single_with_crops(
+            pipe, tile_tensors, tile_batch, device, dtype, args, batch_idx, rank
+        )
+
+    tile_data = []
+    for t_idx, (x1, y1, x2, y2) in enumerate(tile_batch):
+        input_tile = tile_tensors[t_idx]
+        LQ_tile, th, tw, F, N0_tile = prepare_input_tensor(
+            input_tile, device, scale=args.scale, dtype=dtype
+        )
+        if F < 17:
+            log(
+                f"[Rank {rank}] WARNING: Batched tile has F={F}<17, falling back to single-tile processing.",
+                "warning",
+                rank,
+            )
+            return _process_tile_batch_distributed_single_with_crops(
+                pipe, tile_tensors, tile_batch, device, dtype, args, batch_idx, rank
+            )
+        tile_data.append({
+            "LQ_tile": LQ_tile,
+            "th": th,
+            "tw": tw,
+            "F": F,
+            "N0_tile": N0_tile,
+            "coords": (x1, y1, x2, y2),
+            "sH": (y2 - y1) * args.scale,
+            "sW": (x2 - x1) * args.scale,
+        })
+
+    max_F = max(d["F"] for d in tile_data)
+    max_th = max(d["th"] for d in tile_data)
+    max_tw = max(d["tw"] for d in tile_data)
+
+    batched_list = []
+    for d in tile_data:
+        LQ = d["LQ_tile"]
+        F, th, tw = d["F"], d["th"], d["tw"]
+        pad_F = max_F - F
+        pad_th = max_th - th
+        pad_tw = max_tw - tw
+        if pad_F > 0 or pad_th > 0 or pad_tw > 0:
+            LQ = torch.nn.functional.pad(
+                LQ,
+                (0, pad_tw, 0, pad_th, 0, pad_F),
+                mode="replicate",
+            )
+        batched_list.append(LQ)
+    batched_LQ = torch.cat(batched_list, dim=0)
+    if "long" not in args.mode:
+        batched_LQ = batched_LQ.to(device)
+
+    topk_ratio = args.sparse_ratio * 768 * 1280 / (max_th * max_tw)
+    B = len(tile_batch)
+    log(
+        f"[Rank {rank}] Batched inference (streaming): {B} tiles in one pipe call (batch {batch_idx + 1})",
+        "info",
+        rank,
+    )
+    with torch.no_grad():
+        try:
+            output_batched = pipe(
+                prompt="",
+                negative_prompt="",
+                cfg_scale=1.0,
+                num_inference_steps=1,
+                seed=args.seed,
+                tiled=args.tiled_vae,
+                LQ_video=batched_LQ,
+                num_frames=max_F,
+                height=max_th,
+                width=max_tw,
+                is_full_block=False,
+                if_buffer=True,
+                topk_ratio=topk_ratio,
+                kv_ratio=args.kv_ratio,
+                local_range=args.local_range,
+                color_fix=args.color_fix,
+                unload_dit=args.unload_dit,
+            )
+        except (RuntimeError, ValueError) as e:
+            log(
+                f"[Rank {rank}] Batched pipe failed ({e}), falling back to single-tile processing.",
+                "warning",
+                rank,
+            )
+            del batched_LQ, batched_list
+            clean_vram()
+            return _process_tile_batch_distributed_single_with_crops(
+                pipe, tile_tensors, tile_batch, device, dtype, args, batch_idx, rank
+            )
+
+    if isinstance(output_batched, (tuple, list)):
+        output_batched = output_batched[0]
+    B = output_batched.shape[0]
+    results = []
+    for b in range(B):
+        out_b = output_batched[b : b + 1]
+        processed_b = tensor2video(out_b).to("cpu")
+        d = tile_data[b]
+        N0_tile, sH, sW = d["N0_tile"], d["sH"], d["sW"]
+        if processed_b.shape[0] < N0_tile:
+            raise RuntimeError(
+                f"[Rank {rank}] ERROR: Batched output tile {b} has {processed_b.shape[0]} frames, need {N0_tile}."
+            )
+        if processed_b.shape[0] > N0_tile:
+            processed_b = processed_b[:N0_tile]
+        th_out, tw_out = processed_b.shape[1], processed_b.shape[2]
+        if th_out > sH or tw_out > sW:
+            processed_b = processed_b[:, :sH, :sW, :]
+        mask_nchw = create_feather_mask((th_out, tw_out), args.tile_overlap).to("cpu")
+        mask_nchw = mask_nchw[:, :, :sH, :sW]
+        mask_nhwc = mask_nchw.permute(0, 2, 3, 1).expand(
+            processed_b.shape[0], -1, -1, -1
+        )
+        results.append({
+            "coords": d["coords"],
+            "tile": processed_b,
+            "mask": mask_nhwc,
+        })
+    del batched_LQ, output_batched, batched_list
+    clean_vram()
+    return results
+
+
 def _run_tiled_inference_one_pass(
     pipe,
     frames,
@@ -661,12 +892,21 @@ def _run_tiled_inference_one_pass(
     out_W: int,
     C: int,
     checkpoint_dir: str | None,
+    *,
+    input_path: str = None,
+    start_idx: int = None,
+    end_idx: int = None,
+    input_fps: float = 30.0,
+    enable_hdr: bool = False,
+    streaming_hdr_params: dict = None,
 ):
     """跑一遍 tiled 推理并累积到 canvas/weight_canvas，返回 (canvas, weight_canvas)。
     checkpoint_dir 为 None 时不使用 mmap 与断点续跑（用于 tile_shift 双遍时的每一遍）。
     多 GPU 时强制用内存 canvas：与单 GPU 一致（单 GPU 传 checkpoint_dir=None 故用内存），
     避免 memmap + batched 累加时的视图/写入顺序导致乱码。
+    流式输入：当 frames 为 None 时，必须传 input_path, start_idx, end_idx；按 tile 逐批从磁盘读取。
     """
+    use_streaming = frames is None and input_path is not None and start_idx is not None and end_idx is not None
     processed_tiles_file = (
         os.path.join(checkpoint_dir, f"rank_{rank}_processed_tiles.json")
         if checkpoint_dir
@@ -778,7 +1018,10 @@ def _run_tiled_inference_one_pass(
         weight_canvas = torch.zeros_like(canvas)
 
     optimal_batch_size = determine_optimal_batch_size(
-        device, tile_coords, frames, args, rank
+        device, tile_coords,
+        frames if not use_streaming else None,
+        args, rank,
+        segment_n_frames=N if use_streaming else None,
     )
     log(
         f"[Rank {rank}] Processing {len(tile_coords)} tiles with batch_size={optimal_batch_size} "
@@ -817,9 +1060,20 @@ def _run_tiled_inference_one_pass(
             continue
 
         try:
-            results = process_tile_batch_distributed(
-                pipe, frames, device, dtype, args, tiles_to_process, batch_idx, rank
-            )
+            if use_streaming:
+                tile_tensors, _ = inference_io.read_input_frames_range_tile_crops(
+                    input_path, start_idx, end_idx, tiles_to_process,
+                    fps=input_fps, enable_hdr=enable_hdr,
+                    streaming_hdr_params=streaming_hdr_params, args=args,
+                )
+                results = process_tile_batch_distributed_with_crops(
+                    pipe, tile_tensors, device, dtype, args, tiles_to_process, batch_idx, rank
+                )
+                del tile_tensors
+            else:
+                results = process_tile_batch_distributed(
+                    pipe, frames, device, dtype, args, tiles_to_process, batch_idx, rank
+                )
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 log(
@@ -834,16 +1088,27 @@ def _run_tiled_inference_one_pass(
                         continue
                     single_tile_batch = [tile_coord]
                     try:
-                        results = process_tile_batch_distributed(
-                            pipe,
-                            frames,
-                            device,
-                            dtype,
-                            args,
-                            single_tile_batch,
-                            batch_idx,
-                            rank,
-                        )
+                        if use_streaming:
+                            tile_tensors, _ = inference_io.read_input_frames_range_tile_crops(
+                                input_path, start_idx, end_idx, single_tile_batch,
+                                fps=input_fps, enable_hdr=enable_hdr,
+                                streaming_hdr_params=streaming_hdr_params, args=args,
+                            )
+                            results = process_tile_batch_distributed_with_crops(
+                                pipe, tile_tensors, device, dtype, args, single_tile_batch, batch_idx, rank
+                            )
+                            del tile_tensors
+                        else:
+                            results = process_tile_batch_distributed(
+                                pipe,
+                                frames,
+                                device,
+                                dtype,
+                                args,
+                                single_tile_batch,
+                                batch_idx,
+                                rank,
+                            )
                         for result in results:
                             x1, y1, x2, y2 = result["coords"]
                             processed_tile_cpu = result["tile"]
@@ -946,10 +1211,35 @@ def _run_tiled_inference_one_pass(
 
 
 def run_inference_distributed_segment(
-    pipe, frames, device, dtype, args, rank: int, checkpoint_dir: str = None
+    pipe, frames, device, dtype, args, rank: int, checkpoint_dir: str = None,
+    *,
+    input_path: str = None,
+    start_idx: int = None,
+    end_idx: int = None,
+    input_fps: float = 30.0,
+    streaming_input: bool = False,
+    streaming_hdr_params: dict = None,
 ):
-    """在单个 segment 上运行推理（tiled_dit 整图/tile 二选一，tiled_vae 独立控制 VAE 内部分块）。"""
-    N, H, W, C = frames.shape
+    """在单个 segment 上运行推理。streaming_input=True 时 frames 可为 None，按 tile 从 input_path 流式读取。"""
+    enable_hdr = getattr(args, "_enable_hdr", False)
+    if streaming_input and input_path is not None and start_idx is not None and end_idx is not None:
+        N, H, W, C = inference_io.get_segment_shape(input_path, start_idx, end_idx, enable_hdr=enable_hdr)
+        if not args.tiled_dit:
+            log(
+                f"[Rank {rank}] Streaming input only supports tiled_dit=True; whole-frame path requires loading full segment.",
+                "warning",
+                rank,
+            )
+            streaming_input = False
+            frames, _ = inference_io.read_input_frames_range(
+                input_path, start_idx, end_idx, fps=input_fps, enable_hdr=enable_hdr
+            )
+            frames, _ = inference_io.apply_hdr_tone_mapping_if_needed(
+                frames, args, rank=rank, checkpoint_dir=checkpoint_dir
+            )
+            N, H, W, C = frames.shape
+    else:
+        N, H, W, C = frames.shape
     out_H, out_W = H * args.scale, W * args.scale
 
     if not args.tiled_dit:
@@ -1007,6 +1297,13 @@ def run_inference_distributed_segment(
         rank,
     )
     tile_shift = getattr(args, "tile_shift", True)
+    if streaming_input and tile_shift:
+        log(
+            f"[Rank {rank}] Streaming input: tile_shift disabled (single-pass tiled only).",
+            "info",
+            rank,
+        )
+        tile_shift = False
 
     if tile_shift:
         # Tile Shift 双遍推理：正常网格 + 错位半 stride，两遍结果平均以打散固定网格纹
@@ -1048,9 +1345,17 @@ def run_inference_distributed_segment(
             rank,
         )
         log(f"[Rank {rank}] Calculated {len(tile_coords)} tiles to process", "info", rank)
+        if streaming_input:
+            log(f"[Rank {rank}] Using streaming input (per-tile load from disk).", "info", rank)
         canvas, weight_canvas = _run_tiled_inference_one_pass(
             pipe, frames, device, dtype, args, rank,
             tile_coords, N, out_H, out_W, C, checkpoint_dir,
+            input_path=input_path if streaming_input else None,
+            start_idx=start_idx if streaming_input else None,
+            end_idx=end_idx if streaming_input else None,
+            input_fps=input_fps if streaming_input else 30.0,
+            enable_hdr=enable_hdr if streaming_input else False,
+            streaming_hdr_params=streaming_hdr_params if streaming_input else None,
         )
         if checkpoint_dir:
             progress_file = os.path.join(checkpoint_dir, f"rank_{rank}_progress.txt")
@@ -1110,35 +1415,60 @@ def run_single_gpu_inference(args, total_frames: int, input_fps: float, device_i
         0, 1, args.mode, dtype, model_dir, use_shared_memory=False, device_id=device_id
     )
     device_str = ensure_device_str(device_obj)
-    log(f"[Single-GPU] Reading all {total_frames} frames...", "info")
     enable_hdr = getattr(args, "_enable_hdr", False)
-    segment_frames = inference_io.read_input_frames_range(
-        args.input, 0, total_frames, fps=input_fps, enable_hdr=enable_hdr
-    )[0]
-    log(
-        f"[Single-GPU] Loaded {segment_frames.shape[0]} frames, shape: {segment_frames.shape}",
-        "info",
-    )
     checkpoint_dir = args.checkpoint_dir
-    segment_frames, tone_mapping_params = inference_io.apply_hdr_tone_mapping_if_needed(
-        segment_frames, args, rank=0, checkpoint_dir=checkpoint_dir
-    )
-    if segment_frames.shape[0] < 21:
+    streaming_input = getattr(args, "streaming_input", False) and args.tiled_dit
+    tone_mapping_params = None
+    segment_frames = None
+    if streaming_input:
+        if total_frames < 21:
+            log(
+                f"[Single-GPU] ERROR: Video has only {total_frames} frames, minimum is 21. Cannot process.",
+                "error",
+            )
+            raise ValueError(f"Video too short: {total_frames} frames (minimum: 21)")
+        tone_mapping_params = inference_io.get_hdr_tone_mapping_params_lightweight(
+            args.input, 0, total_frames, args, rank=0, checkpoint_dir=checkpoint_dir
+        )
+        if enable_hdr and tone_mapping_params is None:
+            tone_mapping_params = {}
+        log(f"[Single-GPU] Streaming input: per-tile read from disk ({total_frames} frames).", "info")
+    else:
+        log(f"[Single-GPU] Reading all {total_frames} frames...", "info")
+        segment_frames = inference_io.read_input_frames_range(
+            args.input, 0, total_frames, fps=input_fps, enable_hdr=enable_hdr
+        )[0]
         log(
-            f"[Single-GPU] ERROR: Video has only {segment_frames.shape[0]} frames, minimum is 21. Cannot process.",
-            "error",
+            f"[Single-GPU] Loaded {segment_frames.shape[0]} frames, shape: {segment_frames.shape}",
+            "info",
         )
-        raise ValueError(
-            f"Video too short: {segment_frames.shape[0]} frames (minimum: 21)"
+        segment_frames, tone_mapping_params = inference_io.apply_hdr_tone_mapping_if_needed(
+            segment_frames, args, rank=0, checkpoint_dir=checkpoint_dir
         )
+        if segment_frames.shape[0] < 21:
+            log(
+                f"[Single-GPU] ERROR: Video has only {segment_frames.shape[0]} frames, minimum is 21. Cannot process.",
+                "error",
+            )
+            raise ValueError(
+                f"Video too short: {segment_frames.shape[0]} frames (minimum: 21)"
+            )
     log(
-        f"[Single-GPU] Starting inference on {segment_frames.shape[0]} frames...",
+        f"[Single-GPU] Starting inference on {total_frames} frames...",
         "info",
     )
     t0 = time.perf_counter()
-    output = run_inference_distributed_segment(
-        pipe, segment_frames, device_str, dtype, args, rank=0, checkpoint_dir=None
-    )
+    if streaming_input:
+        output = run_inference_distributed_segment(
+            pipe, None, device_str, dtype, args, rank=0, checkpoint_dir=None,
+            input_path=args.input, start_idx=0, end_idx=total_frames,
+            input_fps=input_fps, streaming_input=True,
+            streaming_hdr_params=tone_mapping_params,
+        )
+    else:
+        output = run_inference_distributed_segment(
+            pipe, segment_frames, device_str, dtype, args, rank=0, checkpoint_dir=None
+        )
     elapsed_min = (time.perf_counter() - t0) / 60.0
     log(f"[Single-GPU] ✓ Inference done: {output.shape[0]} frames, total {elapsed_min:.1f} min", "info")
     output = inference_io.apply_inverse_hdr_if_needed(
@@ -1268,25 +1598,54 @@ def run_distributed_inference(
         t0 = time.perf_counter()
         start_idx, end_idx = segments[rank]
         enable_hdr = getattr(args, "_enable_hdr", False)
-        segment_frames = inference_io.read_input_frames_range(
-            args.input, start_idx, end_idx, fps=input_fps, enable_hdr=enable_hdr
-        )[0]
         checkpoint_dir = args.checkpoint_dir
-        segment_frames, tone_mapping_params = (
-            inference_io.apply_hdr_tone_mapping_if_needed(
-                segment_frames, args, rank=rank, checkpoint_dir=checkpoint_dir
+        streaming_input = getattr(args, "streaming_input", False) and args.tiled_dit
+        tone_mapping_params = None
+        segment_frames = None
+        if streaming_input:
+            N_seg = end_idx - start_idx
+            if N_seg < 21:
+                raise ValueError(
+                    f"Segment too short: {N_seg} frames (minimum: 21)"
+                )
+            tone_mapping_params = inference_io.get_hdr_tone_mapping_params_lightweight(
+                args.input, start_idx, end_idx, args, rank=rank,
+                checkpoint_dir=checkpoint_dir,
             )
-        )
-        if segment_frames.shape[0] < 21:
-            raise ValueError(
-                f"Segment too short: {segment_frames.shape[0]} frames (minimum: 21)"
+            if enable_hdr and tone_mapping_params is None:
+                tone_mapping_params = {}
+            log(
+                f"[Rank {rank}] Streaming input: no full segment load, per-tile read from disk.",
+                "info",
+                rank,
             )
+        else:
+            segment_frames = inference_io.read_input_frames_range(
+                args.input, start_idx, end_idx, fps=input_fps, enable_hdr=enable_hdr
+            )[0]
+            segment_frames, tone_mapping_params = (
+                inference_io.apply_hdr_tone_mapping_if_needed(
+                    segment_frames, args, rank=rank, checkpoint_dir=checkpoint_dir
+                )
+            )
+            if segment_frames.shape[0] < 21:
+                raise ValueError(
+                    f"Segment too short: {segment_frames.shape[0]} frames (minimum: 21)"
+                )
         os.makedirs(checkpoint_dir, exist_ok=True)
         output_file = os.path.join(checkpoint_dir, f"rank_{rank}_result.pt")
         try:
-            segment_output = run_inference_distributed_segment(
-                pipe, segment_frames, device, dtype, args, rank, checkpoint_dir
-            )
+            if streaming_input:
+                segment_output = run_inference_distributed_segment(
+                    pipe, None, device, dtype, args, rank, checkpoint_dir,
+                    input_path=args.input, start_idx=start_idx, end_idx=end_idx,
+                    input_fps=input_fps, streaming_input=True,
+                    streaming_hdr_params=tone_mapping_params,
+                )
+            else:
+                segment_output = run_inference_distributed_segment(
+                    pipe, segment_frames, device, dtype, args, rank, checkpoint_dir
+                )
             segment_output = inference_io.apply_inverse_hdr_if_needed(
                 segment_output, tone_mapping_params, args, rank=rank
             )
