@@ -164,21 +164,36 @@ def streaming_merge_from_checkpoint(
     result_files.sort(key=lambda x: x[0])
     effective_world_size = world_size if world_size is not None else (max(r[0] for r in result_files) + 1)
     num_workers = output_workers if output_workers > 0 else min(os.cpu_count() or 8, 32)
+    total_size_mb = sum(mb for _, _, mb in result_files)
 
+    # ---------- 清晰风格：配置与 rank 检测 ----------
     _log("========== Starting Streaming Merge ==========", "info")
     _log(f"Checkpoint directory: {checkpoint_dir}", "info")
     _log(f"Output path: {output_path}", "info")
-    _log(f"Output mode: {output_mode}", "info")
-    _log(f"FPS: {input_fps}", "info")
-    _log(f"Total frames (expected): {total_frames if total_frames is not None else 'auto'}", "info")
-    _log(f"Streaming merge (memory-efficient, CPU only)", "info")
-    total_size_mb = sum(mb for _, _, mb in result_files)
-    _log(f"Found {len(result_files)} rank results, ~{total_size_mb:.0f} MB total", "info")
+    _log(f"Output mode: {output_mode} ({'image sequence' if output_mode == 'pictures' else 'video file'})", "info")
+    _log(f"Expected FPS: {input_fps}", "info")
+    _log(f"Expected total frames: {total_frames if total_frames is not None else 'auto-detect'}", "info")
+    _log(f"World size: {effective_world_size} (from {'args' if world_size is not None else 'auto-detect'})", "info")
+    if output_mode == "pictures" and num_workers > 1:
+        _log(f"Output workers: {num_workers} (multi-threaded frame write)", "info")
+    _log("Using STREAMING merge (memory-efficient, CPU only)", "info")
     _log("=============================================", "info")
+    for r, result_file, file_size_mb in result_files:
+        _log(f"  Rank {r}: ✓ Result file found, {file_size_mb:.2f} MB", "success")
+    rank_order = [r[0] for r in result_files]
+    _log(f"[Merge] Found {len(result_files)} rank results in order: {rank_order}", "info")
+    _log(f"[Merge] Total result files size: {total_size_mb:.2f} MB ({total_size_mb/1024:.2f} GB)", "info")
+    _log("[Merge] Using streaming merge to avoid OOM (peak memory: ~120GB per rank)", "info")
+    _log("", "normal")
+    _log("[Merge] Starting streaming merge and video encoding...", "info")
 
+    # Step 1: 读取首文件获取尺寸
     first_rank, first_file, first_size_mb = result_files[0]
+    _log(f"[Merge] [Step 1/3] Reading first rank ({first_rank}) to get video dimensions...", "info")
     first_result = torch.load(first_file, map_location="cpu")
     F, H, W, C = first_result.shape
+    _log(f"[Merge] [Step 1/3] ✓ Video dimensions: {F} frames (first rank), {H}x{W}x{C}, {input_fps} fps", "success")
+    _log(f"[Merge] [Step 1/3] First rank file size: {first_size_mb:.2f} MB", "info")
     del first_result
     gc.collect()
 
@@ -186,15 +201,24 @@ def streaming_merge_from_checkpoint(
     try:
         if output_mode == "pictures":
             from utils.io.video_io import save_frame_as_dpx10
+            ext = ".dpx" if output_format in ("dpx", "dpx10") else ".png"
+            _log(f"[Merge] [Step 2/2] Output mode: image sequence (pictures), format={output_format}", "info")
+            _log(f"[Merge] Creating output directory: {output_path}", "info")
+            if output_frame_prefix:
+                _log(f"[Merge] Frame naming: {output_frame_prefix}.<index {output_frame_digits}d>{ext}", "info")
             os.makedirs(output_path, exist_ok=True)
             total_frames_written = 0
             last_frame = None
             global_hdr_max_all = None
+            _log(f"[Merge] [Step 2/2] Processing {len(result_files)} rank results and saving as image sequence...", "info")
 
             for rank_idx, (r, result_file, file_size_mb) in enumerate(result_files):
-                _log(f"[{rank_idx + 1}/{len(result_files)}] Loading rank {r} (~{file_size_mb:.0f} MB)...", "info")
+                _log(f"[Merge]   [{rank_idx + 1}/{len(result_files)}] Processing Rank {r}...", "info")
+                _log(f"[Merge]     - Loading from: {result_file}", "info")
+                _log(f"[Merge]     - File size: {file_size_mb:.2f} MB ({file_size_mb/1024:.2f} GB)", "info")
                 segment = torch.load(result_file, map_location="cpu")
                 n_frames = segment.shape[0]
+                _log(f"[Merge]     - ✓ Loaded {n_frames} frames, shape: {tuple(segment.shape)}", "success")
                 last_frame = segment[-1:, :, :, :]
 
                 if output_format in ("dpx", "dpx10"):
@@ -254,11 +278,12 @@ def streaming_merge_from_checkpoint(
                     del seg_np
                 del segment
                 gc.collect()
-                _log(f"  Rank {r}: {n_frames} frames written (total: {total_frames_written})", "success")
+                _log(f"[Merge]     - Saved {n_frames}/{n_frames} frames from Rank {r} (total: {total_frames_written} frames)", "info")
+                _log(f"[Merge]     - ✓ Rank {r} completed. Total frames saved: {total_frames_written}", "success")
 
             if total_frames is not None and total_frames_written < total_frames:
                 missing = total_frames - total_frames_written
-                _log(f"Padding {missing} frames with last frame", "info")
+                _log(f"[Merge] Padding {missing} frames using the last frame...", "info")
                 if last_frame is not None:
                     if output_format in ("dpx", "dpx10"):
                         pad_np = last_frame.cpu().numpy()[0]
@@ -271,6 +296,8 @@ def streaming_merge_from_checkpoint(
                             )
                             save_frame_as_dpx10(pad_np, path, hdr_max=global_hdr_max_all, apply_srgb_gamma=False)
                             total_frames_written += 1
+                            if (i + 1) % 10 == 0 or (i + 1) == missing:
+                                _log(f"[Merge]   Padded {i + 1}/{missing} frames...", "info")
                     else:
                         pad_np = (last_frame.clamp(0, 1) * 255).byte().cpu().numpy().astype("uint8")[0]
                         for i in range(missing):
@@ -280,24 +307,35 @@ def streaming_merge_from_checkpoint(
                             )
                             cv2.imwrite(path, cv2.cvtColor(pad_np, cv2.COLOR_RGB2BGR))
                             total_frames_written += 1
+                            if (i + 1) % 10 == 0 or (i + 1) == missing:
+                                _log(f"[Merge]   Padded {i + 1}/{missing} frames...", "info")
+                _log(f"[Merge] ✓ Padded to {total_frames_written} frames (target: {total_frames})", "success")
             elif total_frames is not None and total_frames_written > total_frames:
-                _log(f"WARNING: {total_frames_written} frames > expected {total_frames}", "warning")
+                _log(f"[Merge] WARNING: Saved {total_frames_written} frames > target {total_frames}. May have extra frames.", "warning")
 
-            _log(f"========== Merge Completed ==========", "finish")
-            _log(f"Output: {output_path}", "finish")
-            _log(f"Frames: {total_frames_written}, size {H}x{W}x{C}", "finish")
+            fmt_desc = f"{output_frame_prefix}.<{output_frame_digits}d>{ext}" if output_frame_prefix else f"frame_XXXXXX{ext}"
+            _log("", "normal")
+            _log("========== Merge Completed Successfully ==========", "finish")
+            _log(f"Output directory: {output_path}", "finish")
+            _log(f"Total frames: {total_frames_written}", "finish")
+            _log(f"Image dimensions: {H}x{W}x{C}", "finish")
+            _log(f"Frame format: {fmt_desc}", "finish")
+            _log("=============================================", "finish")
 
         else:
             # video
             if enable_hdr:
                 from utils.io.video_io import save_frame_as_dpx10
                 from utils.io.hdr_video_encode import encode_hlg_dpx_to_hdr_video
+                _log("[Merge] [Step 2/3] Output mode: video file (HDR)", "info")
                 tmp_dpx_dir = tempfile.mkdtemp(prefix="flashvsr_hdr_")
                 try:
                     total_frames_written = 0
                     for rank_idx, (r, result_file, file_size_mb) in enumerate(result_files):
-                        _log(f"[{rank_idx + 1}/{len(result_files)}] Rank {r}...", "info")
+                        _log(f"[Merge]   [{rank_idx + 1}/{len(result_files)}] Processing Rank {r}...", "info")
+                        _log(f"[Merge]     - Loading from: {result_file}", "info")
                         segment = torch.load(result_file, map_location="cpu")
+                        _log(f"[Merge]     - ✓ Loaded {segment.shape[0]} frames, shape: {tuple(segment.shape)}", "success")
                         for i in range(segment.shape[0]):
                             frame = segment[i].cpu().numpy()
                             path = os.path.join(tmp_dpx_dir, f"frame_{total_frames_written:06d}.dpx")
@@ -306,23 +344,31 @@ def streaming_merge_from_checkpoint(
                         del segment
                         gc.collect()
                     if total_frames_written > 0:
+                        _log("[Merge] [Step 3/3] Encoding HDR video (FFmpeg)...", "info")
                         ok = encode_hlg_dpx_to_hdr_video(
                             tmp_dpx_dir, output_path, fps=input_fps, crf=18, preset="slow", max_hdr_nits=1000.0
                         )
                         if not ok:
                             raise RuntimeError("HDR video encode failed")
-                    _log(f"HDR video saved: {output_path}", "finish")
+                    _log(f"[Merge] ✓ HDR video saved: {output_path}", "finish")
                 finally:
                     import shutil
                     shutil.rmtree(tmp_dpx_dir, ignore_errors=True)
             else:
+                _log("[Merge] [Step 2/3] Output mode: video file", "info")
+                _log("[Merge] Creating temporary raw video file...", "info")
                 tmp_yuv = tempfile.NamedTemporaryFile(suffix=".yuv", delete=False)
                 tmp_yuv_path = tmp_yuv.name
                 total_frames_written = 0
                 last_frame = None
+                _log(f"[Merge] [Step 3/3] Processing {len(result_files)} rank results and writing to temp file...", "info")
                 for rank_idx, (r, result_file, file_size_mb) in enumerate(result_files):
-                    _log(f"[{rank_idx + 1}/{len(result_files)}] Rank {r}...", "info")
+                    _log(f"[Merge]   [{rank_idx + 1}/{len(result_files)}] Processing Rank {r}...", "info")
+                    _log(f"[Merge]     - Loading from: {result_file}", "info")
+                    _log(f"[Merge]     - File size: {file_size_mb:.2f} MB ({file_size_mb/1024:.2f} GB)", "info")
                     segment = torch.load(result_file, map_location="cpu")
+                    _log(f"[Merge]     - ✓ Loaded {segment.shape[0]} frames, shape: {tuple(segment.shape)}", "success")
+                    _log("[Merge]     - Converting to numpy and writing to temp file...", "info")
                     seg_np = (segment.clamp(0, 1) * 255).byte().cpu().numpy().astype("uint8")
                     batch_size = 50
                     for i in range(0, seg_np.shape[0], batch_size):
@@ -332,6 +378,7 @@ def streaming_merge_from_checkpoint(
                     last_frame = segment[-1:, :, :, :]
                     del segment, seg_np
                     gc.collect()
+                    _log(f"[Merge]     - ✓ Rank {r} completed. Total frames in temp file: {total_frames_written}", "success")
 
                 if total_frames is not None and total_frames_written < total_frames and last_frame is not None:
                     pad_np = (last_frame.clamp(0, 1) * 255).byte().cpu().numpy()
@@ -339,6 +386,9 @@ def streaming_merge_from_checkpoint(
                         tmp_yuv.write(pad_np[0].tobytes())
                         total_frames_written += 1
                 tmp_yuv.close()
+                tmp_yuv_size_mb = os.path.getsize(tmp_yuv_path) / (1024 ** 2)
+                _log(f"[Merge] ✓ Temp file created: {tmp_yuv_size_mb:.2f} MB ({tmp_yuv_size_mb/1024:.2f} GB)", "success")
+                _log("[Merge] Starting FFmpeg encoding from temp file...", "info")
 
                 cmd = [
                     "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
@@ -356,7 +406,13 @@ def streaming_merge_from_checkpoint(
                 except Exception:
                     pass
                 tmp_yuv_path = None
-                _log(f"Video saved: {output_path}", "finish")
+                _log("", "normal")
+                _log("========== Merge Completed Successfully ==========", "finish")
+                _log(f"Output video: {output_path}", "finish")
+                _log(f"Total frames: {total_frames_written}", "finish")
+                _log(f"Video dimensions: {H}x{W}x{C}", "finish")
+                _log(f"FPS: {input_fps}", "finish")
+                _log("=============================================", "finish")
     finally:
         if tmp_yuv_path and os.path.exists(tmp_yuv_path):
             try:
