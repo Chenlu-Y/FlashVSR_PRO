@@ -610,18 +610,175 @@ Worker 0处理完所有sub-segments后：
    - segmented: 检查`/tmp/flashvsr_segments/{video_dir_name}/segment_*.pt`文件
    - 使用`--resume`参数启用断点续传，否则默认覆盖重新开始
 
-### 恢复工具
+### 正常跑与从 Checkpoint 恢复（参数与用法）
+
+当前入口脚本为 **`scripts/infer_video.py`**（支持单卡与多卡分布式）。推理结果与合并逻辑与 **恢复工具** `tools/recover_distributed_inference.py` 共用同一套流式合并实现（`utils/io/streaming_merge_output`），因此正常跑完成后的输出与“先中断再恢复合并”的输出一致。
+
+---
+
+#### 一、正常跑（scripts/infer_video.py）
+
+**必需参数：**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `--input` | str | **必需**。输入路径：视频文件（如 video.mp4）或图像序列目录（如 /path/to/frames/） |
+
+**常用可选参数（含默认值）：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--output` | str | 自动生成 | 输出路径：`output_mode=video` 时为视频文件；`output_mode=pictures` 时为目录 |
+| `--output_mode` | str | `video` | 输出形式：`video`（单视频文件）或 `pictures`（图像序列） |
+| `--output_format` | str | 见下 | 视频：`mp4`/`mov`/`mkv`（未设则尽量继承输入）；序列帧：`png`/`dpx` |
+| `--output_bit_depth` | int | `8` | 位深：8 或 10（视频→yuv420p/yuv420p10le；序列帧→8bit PNG / 10bit DPX） |
+| `--input_fps` | float | `30.0` | 输入为图像序列时的帧率；视频文件时自动探测，可忽略 |
+| `--output_fps` | float | None | 输出视频帧率；未设则继承输入 FPS |
+| `--dynamic_range` | str | `sdr` | 动态范围：`sdr` / `hdr` / `auto` |
+| `--hdr_preprocess` | str | `hlg` | HDR 时预处理：`hlg`（推荐）或 `tone_mapping` |
+| `--tone_mapping_method` | str | `logarithmic` | 仅 `hdr_preprocess=tone_mapping` 时：`reinhard` / `logarithmic` / `aces` |
+| `--tone_mapping_exposure` | float | `1.0` | Tone Mapping 曝光调整 |
+| `--global_l_max` | float | None | 可选；Tone Mapping 工作流下全局 l_max，减少闪烁 |
+| `--hdr_transfer` | str | `hdr10` | HDR 视频输出：`hdr10` 或 `hlg` |
+| `--model_ver` | str | `1.1` | 模型版本：`1.0` / `1.1` |
+| `--mode` | str | `tiny` | 模型模式：`tiny` / `full` / `tiny-long` |
+| `--scale` | int | `4` | 放大倍数：2 / 3 / 4 |
+| `--precision` | str | `bf16` | 精度：`fp32` / `fp16` / `bf16` |
+| `--tile_size` | int | `256` | Tile 边长（像素） |
+| `--tile_overlap` | int | `24` | Tile 重叠像素 |
+| `--segment_overlap` | int | `2` | 多卡时分段重叠帧数 |
+| `--devices` | str | None | GPU：`all` 或 `0,1,2`、`0-2` 等 |
+| `--resume` | flag | 默认 True | 从 checkpoint 续跑（存在则接着跑） |
+| `--no-resume` / `--force` | flag | - | 清空 checkpoint 从头跑 |
+| `--use_shared_memory` | bool | True | 使用 /dev/shm 加载模型 |
+| `--cleanup_mmap` | bool | False | 保存结果后是否删除 mmap 画布文件 |
+| `--tile_batch_size` | int | `0` | 每批 tile 数；0 表示自动 |
+| `--adaptive_tile_batch` | bool | True | 是否根据显存自适应 tile 批大小 |
+| `--max_frames` | int | None | 仅处理前 N 帧（测试用） |
+
+**Checkpoint 目录：** 由 `--output` 与 `--output_mode` 自动推断，启动时打印，例如：`[Main] Checkpoint directory: /app/tmp/checkpoints/输出名`。其中“输出名”：视频模式为输出文件主名，序列帧模式为输出目录名。
+
+**正常跑示例：**
+
+```bash
+# 多卡、输出视频
+python scripts/infer_video.py \
+  --input video.mp4 \
+  --output output_4x.mp4 \
+  --mode tiny \
+  --scale 4 \
+  --devices all
+
+# 输出序列帧（PNG）
+python scripts/infer_video.py \
+  --input video.mp4 \
+  --output_mode pictures \
+  --output /path/to/out_frames \
+  --output_format png \
+  --devices all
+
+# 输出 10-bit DPX 序列（HDR）
+python scripts/infer_video.py \
+  --input hdr_input/ \
+  --output_mode pictures \
+  --output /path/to/dpx_out \
+  --output_format dpx \
+  --output_bit_depth 10 \
+  --dynamic_range hdr \
+  --hdr_preprocess hlg \
+  --devices all
+```
+
+---
+
+#### 二、从 Checkpoint 恢复（tools/recover_distributed_inference.py）
+
+用于：推理中断或部分 rank 失败后，从已有 checkpoint 目录**仅做流式合并与输出**（与正常跑使用同一套合并逻辑）。
+
+**必需参数：**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `--checkpoint_dir` | str | **必需**。checkpoint 目录（与正常跑日志中的 `[Main] Checkpoint directory: ...` 一致，如 `/app/tmp/checkpoints/输出名`） |
+
+**子命令与合并相关参数：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--status` | flag | - | 检查各 rank 状态（完成/失败/进度等） |
+| `--merge_partial` | flag | - | 流式合并已有 rank 结果并写出（部分 rank 失败也可合并） |
+| `--output` | str | - | **使用 `--merge_partial` 时必需**。输出路径：视频文件或序列帧目录 |
+| `--fps` | float | `30.0` | 输出视频帧率（或序列帧名义 FPS） |
+| `--world_size` | int | None | rank 总数；不设则从 checkpoint 目录自动推断 |
+| `--total_frames` | int | None | 期望总帧数（用于填充不足或校验；不设则按实际合并帧数） |
+| `--output_mode` | str | `video` | 与正常跑一致：`video` 或 `pictures` |
+| `--output_format` | str | `png` | 仅 `output_mode=pictures` 时：`png` 或 `dpx10` |
+| `--output_frame_prefix` | str | None | 序列帧文件名前缀（如 H001_11261139_C001） |
+| `--output_frame_digits` | int | `6` | 序列帧索引位数 |
+| `--workers` | int | `0` | 写序列帧时的线程数；0 表示自动 |
+| `--recover_rank` | int | - | 仅打印恢复某一 rank 的说明，不执行合并 |
+
+**恢复示例：**
+
+```bash
+# 查看 checkpoint 下各 rank 状态
+python tools/recover_distributed_inference.py \
+  --checkpoint_dir /app/tmp/checkpoints/输出名 \
+  --status
+
+# 合并为视频（与正常跑同逻辑，流式合并）
+python tools/recover_distributed_inference.py \
+  --checkpoint_dir /app/tmp/checkpoints/输出名 \
+  --merge_partial \
+  --output output_partial.mp4 \
+  --fps 30.0
+
+# 合并为序列帧（PNG）
+python tools/recover_distributed_inference.py \
+  --checkpoint_dir /app/tmp/checkpoints/输出名 \
+  --merge_partial \
+  --output /path/to/out_frames \
+  --output_mode pictures \
+  --output_format png \
+  --fps 30.0
+
+# 合并为 10-bit DPX 序列
+python tools/recover_distributed_inference.py \
+  --checkpoint_dir /app/tmp/checkpoints/输出名 \
+  --merge_partial \
+  --output /path/to/dpx_out \
+  --output_mode pictures \
+  --output_format dpx10 \
+  --fps 30.0
+
+# 合并为序列帧并指定文件名前缀、索引位数、写帧线程数（如 H001_11261139_C001.00000000.png）
+python tools/recover_distributed_inference.py \
+  --checkpoint_dir /app/tmp/checkpoints/输出名 \
+  --merge_partial \
+  --output /path/to/out_frames \
+  --output_mode pictures \
+  --output_format png \
+  --output_frame_prefix "H001_11261139_C001" \
+  --output_frame_digits 8 \
+  --workers 32 \
+  --fps 30.0
+```
+
+**说明：** 正常跑完成后由 Rank 0 调用的合并与恢复工具的 `--merge_partial` 均走 `utils/io/streaming_merge_output.streaming_merge_from_checkpoint`，因此输出格式与画质一致；恢复时只需保证 `--output_mode`、`--output_format`、`--fps` 等与正常跑意图一致即可。
+
+---
+
+### 恢复工具（旧版说明，保留参考）
 
 如果处理过程中断，可以使用恢复工具手动合并已完成的文件：
 
-**从worker文件恢复：**
+**从 checkpoint 合并为视频：**
 ```bash
-python tools/recover_distributed_inference.py /tmp/flashvsr_multigpu/{video_dir_name} /app/output/recovered.mp4 --fps 30
-```
-
-**查找未合并的文件：**
-```bash
-python tools/find_unmerged.py
+python tools/recover_distributed_inference.py \
+  --checkpoint_dir /app/tmp/checkpoints/{输出名} \
+  --merge_partial \
+  --output /path/to/recovered.mp4 \
+  --fps 30
 ```
 
 ## 故障排除

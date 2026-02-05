@@ -603,18 +603,174 @@ Main process:
    - segmented: Check `/tmp/flashvsr_segments/{video_dir_name}/segment_*.pt` files
    - Use `--resume` parameter to enable resume, otherwise defaults to overwrite and restart
 
-### Recovery Tools
+### Normal Run vs. Checkpoint Recovery (Parameters and Usage)
 
-If processing is interrupted, you can use recovery tools to manually merge completed files:
+The main entry script is **`scripts/infer_video.py`** (single-GPU and multi-GPU distributed). It shares the same **streaming merge** implementation with **`tools/recover_distributed_inference.py`** (`utils/io/streaming_merge_output`), so output from a full run and from "resume merge" is identical.
 
-**Recover from worker files:**
+---
+
+#### 1. Normal Run (scripts/infer_video.py)
+
+**Required:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `--input` | str | **Required.** Input path: video file (e.g. video.mp4) or image sequence directory (e.g. /path/to/frames/) |
+
+**Common optional parameters (with defaults):**
+
+| Parameter | Type | Default | Description |
+|------------|------|---------|-------------|
+| `--output` | str | auto | Output path: video file when `output_mode=video`, directory when `output_mode=pictures` |
+| `--output_mode` | str | `video` | `video` (single file) or `pictures` (image sequence) |
+| `--output_format` | str | see below | Video: `mp4`/`mov`/`mkv` (default from input when possible); pictures: `png`/`dpx` |
+| `--output_bit_depth` | int | `8` | 8 or 10 (video→yuv420p/yuv420p10le; pictures→8-bit PNG / 10-bit DPX) |
+| `--input_fps` | float | `30.0` | FPS for image-sequence input; ignored for video (probed from file) |
+| `--output_fps` | float | None | Output video FPS; if unset, inherits input FPS |
+| `--dynamic_range` | str | `sdr` | `sdr` / `hdr` / `auto` |
+| `--hdr_preprocess` | str | `hlg` | When HDR: `hlg` (recommended) or `tone_mapping` |
+| `--tone_mapping_method` | str | `logarithmic` | When `hdr_preprocess=tone_mapping`: `reinhard` / `logarithmic` / `aces` |
+| `--tone_mapping_exposure` | float | `1.0` | Tone mapping exposure |
+| `--global_l_max` | float | None | Optional global l_max for tone-mapping workflow (reduces flicker) |
+| `--hdr_transfer` | str | `hdr10` | HDR video output: `hdr10` or `hlg` |
+| `--model_ver` | str | `1.1` | Model version: `1.0` / `1.1` |
+| `--mode` | str | `tiny` | Model mode: `tiny` / `full` / `tiny-long` |
+| `--scale` | int | `4` | Upscale factor: 2 / 3 / 4 |
+| `--precision` | str | `bf16` | `fp32` / `fp16` / `bf16` |
+| `--tile_size` | int | `256` | Tile size (pixels) |
+| `--tile_overlap` | int | `24` | Tile overlap (pixels) |
+| `--segment_overlap` | int | `2` | Overlap frames between segments (multi-GPU) |
+| `--devices` | str | None | GPUs: `all` or e.g. `0,1,2`, `0-2` |
+| `--resume` | flag | default True | Resume from checkpoint if present |
+| `--no-resume` / `--force` | flag | - | Clear checkpoint and run from scratch |
+| `--use_shared_memory` | bool | True | Use /dev/shm for model loading |
+| `--cleanup_mmap` | bool | False | Remove mmap canvas files after saving |
+| `--tile_batch_size` | int | `0` | Tiles per batch; 0 = auto |
+| `--adaptive_tile_batch` | bool | True | Adaptive tile batch size from VRAM |
+| `--max_frames` | int | None | Process only first N frames (testing) |
+
+**Checkpoint directory:** Inferred from `--output` and `--output_mode`; printed at startup, e.g. `[Main] Checkpoint directory: /app/tmp/checkpoints/out_name`. For video mode the name is the output file stem; for pictures it is the output directory name.
+
+**Normal run examples:**
+
 ```bash
-python tools/recover_distributed_inference.py /tmp/flashvsr_multigpu/{video_dir_name} /app/output/recovered.mp4 --fps 30
+# Multi-GPU, output video
+python scripts/infer_video.py \
+  --input video.mp4 \
+  --output output_4x.mp4 \
+  --mode tiny \
+  --scale 4 \
+  --devices all
+
+# Output image sequence (PNG)
+python scripts/infer_video.py \
+  --input video.mp4 \
+  --output_mode pictures \
+  --output /path/to/out_frames \
+  --output_format png \
+  --devices all
+
+# Output 10-bit DPX sequence (HDR)
+python scripts/infer_video.py \
+  --input hdr_input/ \
+  --output_mode pictures \
+  --output /path/to/dpx_out \
+  --output_format dpx \
+  --output_bit_depth 10 \
+  --dynamic_range hdr \
+  --hdr_preprocess hlg \
+  --devices all
 ```
 
-**Find unmerged files:**
+---
+
+#### 2. Checkpoint Recovery (tools/recover_distributed_inference.py)
+
+Use when inference was interrupted or some ranks failed: **only runs streaming merge and write** from an existing checkpoint directory (same merge logic as normal run).
+
+**Required:**
+
+| Parameter | Type | Description |
+|------------|------|-------------|
+| `--checkpoint_dir` | str | **Required.** Checkpoint directory (same as printed in normal run: e.g. `/app/tmp/checkpoints/out_name`) |
+
+**Subcommands and merge parameters:**
+
+| Parameter | Type | Default | Description |
+|------------|------|---------|-------------|
+| `--status` | flag | - | Check status of each rank (done/failed/progress) |
+| `--merge_partial` | flag | - | Stream-merge existing rank results and write output (works even if some ranks failed) |
+| `--output` | str | - | **Required with `--merge_partial`.** Output path: video file or picture directory |
+| `--fps` | float | `30.0` | Output video FPS (or nominal FPS for sequence) |
+| `--world_size` | int | None | Number of ranks; if unset, inferred from checkpoint dir |
+| `--total_frames` | int | None | Expected total frames (for padding/validation; optional) |
+| `--output_mode` | str | `video` | Same as normal run: `video` or `pictures` |
+| `--output_format` | str | `png` | When `output_mode=pictures`: `png` or `dpx10` |
+| `--output_frame_prefix` | str | None | Frame filename prefix (e.g. H001_11261139_C001) |
+| `--output_frame_digits` | int | `6` | Number of digits for frame index |
+| `--workers` | int | `0` | Threads for writing frames; 0 = auto |
+| `--recover_rank` | int | - | Print instructions for recovering a specific rank (no merge) |
+
+**Recovery examples:**
+
 ```bash
-python tools/find_unmerged.py
+# Check status of ranks in checkpoint
+python tools/recover_distributed_inference.py \
+  --checkpoint_dir /app/tmp/checkpoints/out_name \
+  --status
+
+# Merge to video (same streaming merge as normal run)
+python tools/recover_distributed_inference.py \
+  --checkpoint_dir /app/tmp/checkpoints/out_name \
+  --merge_partial \
+  --output output_partial.mp4 \
+  --fps 30.0
+
+# Merge to image sequence (PNG)
+python tools/recover_distributed_inference.py \
+  --checkpoint_dir /app/tmp/checkpoints/out_name \
+  --merge_partial \
+  --output /path/to/out_frames \
+  --output_mode pictures \
+  --output_format png \
+  --fps 30.0
+
+# Merge to 10-bit DPX sequence
+python tools/recover_distributed_inference.py \
+  --checkpoint_dir /app/tmp/checkpoints/out_name \
+  --merge_partial \
+  --output /path/to/dpx_out \
+  --output_mode pictures \
+  --output_format dpx10 \
+  --fps 30.0
+
+# Merge to image sequence with custom prefix, index digits, and write threads (e.g. H001_11261139_C001.00000000.png)
+python tools/recover_distributed_inference.py \
+  --checkpoint_dir /app/tmp/checkpoints/out_name \
+  --merge_partial \
+  --output /path/to/out_frames \
+  --output_mode pictures \
+  --output_format png \
+  --output_frame_prefix "H001_11261139_C001" \
+  --output_frame_digits 8 \
+  --workers 32 \
+  --fps 30.0
+```
+
+**Note:** Both the merge run by Rank 0 after a normal run and `--merge_partial` use `utils/io/streaming_merge_output.streaming_merge_from_checkpoint`, so output is identical; when recovering, set `--output_mode`, `--output_format`, `--fps`, etc. to match what you would use in a normal run.
+
+---
+
+### Recovery Tools (legacy reference)
+
+If processing is interrupted, you can merge completed results with:
+
+```bash
+python tools/recover_distributed_inference.py \
+  --checkpoint_dir /app/tmp/checkpoints/{out_name} \
+  --merge_partial \
+  --output /path/to/recovered.mp4 \
+  --fps 30
 ```
 
 ## Acknowledgments

@@ -745,11 +745,13 @@ def save_merged_as_hdr_video(merged: torch.Tensor, output_path: str, args, fps: 
 
 
 # ==============================================================
-#                分布式合并保存
+#                分布式合并保存（委托流式合并模块）
 # ==============================================================
 
 def merge_and_save_distributed_results(checkpoint_dir, args, world_size, total_frames, input_fps):
-    """Rank 0：等待所有 rank 完成，流式合并并保存结果。"""
+    """Rank 0：等待所有 rank 完成，再调用流式合并并保存（与恢复工具共用同一实现）。"""
+    from utils.io import streaming_merge_output
+
     rank = 0
     output_path = args.output if args.output else get_default_output_path(args.input, args.scale)
     log(f"[Rank 0] ========== Rank 0: Merging Results ==========", "info", rank)
@@ -784,99 +786,32 @@ def merge_and_save_distributed_results(checkpoint_dir, args, world_size, total_f
         raise RuntimeError("[Rank 0] No valid results to merge!")
 
     result_files.sort(key=lambda x: x[0])
-    total_result_mb = sum(mb for _, _, mb in result_files)
-    log(f"[Rank 0] Merging {len(result_files)} result files (~{total_result_mb:.0f} MB total), CPU/disk only (GPU idle is normal)", "info", rank)
     output_mode = getattr(args, 'output_mode', 'video')
-    output_path = args.output if args.output else get_default_output_path(args.input, args.scale)
-    first_rank, first_file, _ = result_files[0]
-    first_result = torch.load(first_file, map_location='cpu')
-    F, H, W, C = first_result.shape
-    fps = input_fps
-    del first_result
-    gc.collect()
-
+    output_format = getattr(args, 'output_format', 'png')
+    input_filenames = None
     if output_mode == "pictures":
-        os.makedirs(output_path, exist_ok=True)
-        output_format = getattr(args, 'output_format', 'png')
         input_filenames = get_input_image_sequence_filenames(
             args.input, enable_hdr=getattr(args, '_enable_hdr', False)
         )
-        total_frames_written = 0
-        for idx, (r, result_file, mb) in enumerate(result_files):
-            log(f"[Rank 0] Merge progress: loading rank {r} ({idx + 1}/{len(result_files)}), ~{mb:.0f} MB...", "info", rank)
-            segment = torch.load(result_file, map_location='cpu')
-            if output_format in ("dpx", "dpx10"):
-                from utils.io.video_io import save_frame_as_dpx10
-                global_hdr_max = getattr(args, 'global_l_max', None)
-                for i in range(segment.shape[0]):
-                    frame = segment[i].cpu().numpy()
-                    frame_filename = _output_filename_for_frame(
-                        total_frames_written, output_path, output_format, input_filenames
-                    )
-                    save_frame_as_dpx10(frame, frame_filename, hdr_max=global_hdr_max, apply_srgb_gamma=False)
-                    total_frames_written += 1
-            else:
-                seg_np = (segment.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
-                for i in range(seg_np.shape[0]):
-                    frame_filename = _output_filename_for_frame(
-                        total_frames_written, output_path, output_format, input_filenames
-                    )
-                    cv2.imwrite(frame_filename, cv2.cvtColor(seg_np[i], cv2.COLOR_RGB2BGR))
-                    total_frames_written += 1
-            del segment
-            gc.collect()
-        log(f"[Rank 0] ✓ Image sequence saved: {output_path}", "finish", rank)
-    else:
-        if getattr(args, '_enable_hdr', False):
-            from utils.io.video_io import save_frame_as_dpx10
-            tmp_dpx_dir = tempfile.mkdtemp(prefix="flashvsr_hdr_")
-            try:
-                total_frames_written = 0
-                for idx, (r, result_file, mb) in enumerate(result_files):
-                    log(f"[Rank 0] Merge progress: loading rank {r} ({idx + 1}/{len(result_files)}), ~{mb:.0f} MB...", "info", rank)
-                    segment = torch.load(result_file, map_location='cpu')
-                    for i in range(segment.shape[0]):
-                        frame = segment[i].cpu().numpy()
-                        path = os.path.join(tmp_dpx_dir, f"frame_{total_frames_written:06d}.dpx")
-                        save_frame_as_dpx10(frame, path, hdr_max=None, apply_srgb_gamma=False)
-                        total_frames_written += 1
-                    del segment
-                    gc.collect()
-                if total_frames_written > 0:
-                    log(f"[Rank 0] Merge progress: encoding HDR video (FFmpeg)...", "info", rank)
-                    from utils.io.hdr_video_encode import encode_hlg_dpx_to_hdr_video
-                    ok = encode_hlg_dpx_to_hdr_video(tmp_dpx_dir, output_path, fps=fps, crf=18, preset="slow", max_hdr_nits=1000.0)
-                    if not ok:
-                        raise RuntimeError("HDR 视频编码失败")
-                log(f"[Rank 0] ✓ HDR video saved: {output_path}", "finish", rank)
-            finally:
-                shutil.rmtree(tmp_dpx_dir, ignore_errors=True)
-        else:
-            tmp_yuv = tempfile.NamedTemporaryFile(suffix='.yuv', delete=False)
-            tmp_yuv_path = tmp_yuv.name
-            total_frames_written = 0
-            for idx, (r, result_file, mb) in enumerate(result_files):
-                log(f"[Rank 0] Merge progress: loading rank {r} ({idx + 1}/{len(result_files)}), ~{mb:.0f} MB...", "info", rank)
-                segment = torch.load(result_file, map_location='cpu')
-                seg_np = (segment.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
-                tmp_yuv.write(seg_np.tobytes())
-                total_frames_written += seg_np.shape[0]
-                del segment, seg_np
-                gc.collect()
-            tmp_yuv.close()
-            log(f"[Rank 0] Merge progress: encoding video (FFmpeg)...", "info", rank)
-            cmd = [
-                'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
-                '-s', f'{W}x{H}', '-pix_fmt', 'rgb24', '-r', str(fps), '-i', tmp_yuv_path,
-                '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-crf', '18', output_path,
-            ]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-            if result.returncode != 0 or not os.path.exists(output_path):
-                raise RuntimeError(f"FFmpeg failed: {result.stderr.decode('utf-8', errors='ignore')[:500]}")
-            try:
-                os.unlink(tmp_yuv_path)
-            except Exception:
-                pass
-            log(f"[Rank 0] ✓ Video saved: {output_path}", "finish", rank)
 
+    def _log_fn(msg: str, msg_type: str) -> None:
+        log(f"[Rank 0] {msg}", msg_type, rank)
+
+    streaming_merge_output.streaming_merge_from_checkpoint(
+        checkpoint_dir=checkpoint_dir,
+        output_path=output_path,
+        input_fps=input_fps,
+        world_size=world_size,
+        total_frames=total_frames,
+        output_mode=output_mode,
+        output_format=output_format,
+        output_frame_prefix=getattr(args, 'output_frame_prefix', None),
+        output_frame_digits=getattr(args, 'output_frame_digits', 6),
+        output_workers=getattr(args, 'output_workers', 0),
+        result_files=result_files,
+        input_filenames=input_filenames,
+        enable_hdr=getattr(args, '_enable_hdr', False),
+        global_l_max=getattr(args, 'global_l_max', None),
+        log_fn=_log_fn,
+    )
     log(f"[Rank 0] Checkpoint directory preserved: {checkpoint_dir}", "info", rank)
