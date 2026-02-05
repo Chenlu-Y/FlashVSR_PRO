@@ -23,6 +23,7 @@ import os
 import sys
 import argparse
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 # 添加项目根目录到 sys.path，确保可以导入 utils 模块
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -167,7 +168,44 @@ def check_status(checkpoint_dir: str):
         if status['error']:
             log(f"  Error: {status.get('error_msg', 'Unknown error')[:200]}...", "error")
 
-def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: float = 30.0, world_size: int = 8, total_frames: int = None, output_mode: str = "video", output_format: str = "png"):
+def _detect_result_files(checkpoint_dir: str, world_size: Optional[int] = None):
+    """从 checkpoint 目录收集所有 rank_*_result.pt。若未指定 world_size 则自动扫描目录。"""
+    import re
+    result_files = []
+    if world_size is not None:
+        for rank in range(world_size):
+            result_file = os.path.join(checkpoint_dir, f"rank_{rank}_result.pt")
+            if os.path.exists(result_file):
+                file_size_mb = os.path.getsize(result_file) / (1024**2)
+                result_files.append((rank, result_file, file_size_mb))
+    else:
+        pattern = re.compile(r"rank_(\d+)_result\.pt$")
+        for name in os.listdir(checkpoint_dir):
+            m = pattern.match(name)
+            if m:
+                rank = int(m.group(1))
+                result_file = os.path.join(checkpoint_dir, name)
+                try:
+                    file_size_mb = os.path.getsize(result_file) / (1024**2)
+                    result_files.append((rank, result_file, file_size_mb))
+                except Exception as e:
+                    log(f"  Rank {rank}: ✗ Error: {e}", "error")
+        result_files.sort(key=lambda x: x[0])
+    return result_files
+
+
+def merge_partial_results(
+    checkpoint_dir: str,
+    output_path: str,
+    input_fps: float = 30.0,
+    world_size: Optional[int] = None,
+    total_frames: Optional[int] = None,
+    output_mode: str = "video",
+    output_format: str = "png",
+    output_frame_prefix: Optional[str] = None,
+    output_frame_digits: int = 6,
+    output_workers: int = 0,
+):
     """流式合并部分结果（即使有些 rank 失败）。
     
     使用流式合并策略，逐个加载 rank 结果并直接写入视频，避免一次性加载所有到内存。
@@ -180,32 +218,35 @@ def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: floa
     """
     import subprocess
     import gc
+
+    def _frame_filename(idx: int, ext: str) -> str:
+        """生成单帧文件名：有 prefix 时为 {prefix}.{idx:0Nd}.ext，否则为 frame_{idx:06d}.ext"""
+        if output_frame_prefix:
+            return os.path.join(output_path, f"{output_frame_prefix}.{idx:0{output_frame_digits}d}{ext}")
+        return os.path.join(output_path, f"frame_{idx:06d}{ext}")
     
+    # 自动检测或使用传入的 world_size 收集结果文件
+    result_files = _detect_result_files(checkpoint_dir, world_size)
+    detected_ranks = max((r[0] for r in result_files), default=-1) + 1
+    effective_world_size = world_size if world_size is not None else detected_ranks
+
     log(f"========== Starting Streaming Merge ==========", "info")
     log(f"Checkpoint directory: {checkpoint_dir}", "info")
     log(f"Output path: {output_path}", "info")
     log(f"Output mode: {output_mode} ({'video file' if output_mode == 'video' else 'image sequence'})", "info")
     log(f"Expected FPS: {input_fps}", "info")
     log(f"Expected total frames: {total_frames if total_frames else 'auto-detect'}", "info")
-    log(f"World size: {world_size}", "info")
+    log(f"World size: {effective_world_size} (from {'args' if world_size is not None else 'auto-detect'})", "info")
+    num_workers = output_workers if output_workers > 0 else min(os.cpu_count() or 8, 32)
+    if output_mode == "pictures" and num_workers > 1:
+        log(f"Output workers: {num_workers} (multi-threaded frame write)", "info")
     log(f"Using STREAMING merge (memory-efficient, CPU only)", "info")
     log(f"=============================================", "info")
     
-    # 收集所有有效的结果文件信息（不加载数据）
-    result_files = []
     total_size_mb = 0
-    for rank in range(world_size):
-        result_file = os.path.join(checkpoint_dir, f"rank_{rank}_result.pt")
-        if os.path.exists(result_file):
-            try:
-                file_size_mb = os.path.getsize(result_file) / (1024**2)
-                total_size_mb += file_size_mb
-                result_files.append((rank, result_file, file_size_mb))
-                log(f"  Rank {rank}: ✓ Result file found, {file_size_mb:.2f} MB", "success")
-            except Exception as e:
-                log(f"  Rank {rank}: ✗ Error checking file: {e}", "error")
-        else:
-            log(f"  Rank {rank}: ✗ Result file not found", "warning")
+    for r, result_file, file_size_mb in result_files:
+        total_size_mb += file_size_mb
+        log(f"  Rank {r}: ✓ Result file found, {file_size_mb:.2f} MB", "success")
     
     if not result_files:
         log("ERROR: No valid results to merge!", "error")
@@ -239,7 +280,9 @@ def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: floa
             # 序列帧模式：直接输出为图像序列，无需临时文件
             log(f"[Merge] [Step 2/2] Output mode: image sequence (pictures), format={output_format}", "info")
             log(f"[Merge] Creating output directory: {output_path}", "info")
-            
+            if output_frame_prefix:
+                ext = ".dpx" if output_format == "dpx10" else ".png"
+                log(f"[Merge] Frame naming: {output_frame_prefix}.<index {output_frame_digits}d>{ext}", "info")
             # 确保输出目录存在
             os.makedirs(output_path, exist_ok=True)
             
@@ -292,7 +335,7 @@ def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: floa
                         if global_hdr_max is None:
                             global_hdr_max = segment.max().item()
                             # 尝试从其他rank的参数文件中查找更大的值
-                            for other_rank in range(world_size):
+                            for other_rank in range(effective_world_size):
                                 if other_rank == r:
                                     continue
                                 other_params_file = os.path.join(checkpoint_dir, f"rank_{other_rank}_tone_mapping_params.json")
@@ -320,30 +363,44 @@ def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: floa
                     else:
                         log(f"[Merge] [HDR] 保存为线性 RGB DPX（HDR格式），可用于生成 HDR 视频", "info")
                     
-                    frames_in_rank = 0
-                    for frame_idx in range(segment.shape[0]):
-                        frame = segment[frame_idx].cpu().numpy()  # 不clamp，保留HDR值
-                        # 对于SDR，确保在[0,1]范围内
+                    segment_np_dpx = segment.cpu().numpy()
+                    n_frames_dpx = segment_np_dpx.shape[0]
+                    base_idx_dpx = total_frames_written
+
+                    def _write_one_dpx(frame_idx: int) -> None:
+                        frame = segment_np_dpx[frame_idx]
                         if not is_hdr:
                             frame = np.clip(frame, 0, 1)
-                        frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.dpx")
-                        save_frame_as_dpx10(frame, frame_filename, hdr_max=global_hdr_max, apply_srgb_gamma=apply_srgb_gamma)
-                        frames_in_rank += 1
-                        total_frames_written += 1
-                        if frames_in_rank % 50 == 0 or frames_in_rank == segment.shape[0]:
-                            log(f"[Merge]     - Saved {frames_in_rank}/{segment.shape[0]} frames from Rank {r} (total: {total_frames_written} frames)", "info")
+                        path = _frame_filename(base_idx_dpx + frame_idx, ".dpx")
+                        save_frame_as_dpx10(frame, path, hdr_max=global_hdr_max, apply_srgb_gamma=apply_srgb_gamma)
+
+                    if num_workers > 1:
+                        with ThreadPoolExecutor(max_workers=num_workers) as ex:
+                            list(ex.map(_write_one_dpx, range(n_frames_dpx)))
+                    else:
+                        for frame_idx in range(n_frames_dpx):
+                            _write_one_dpx(frame_idx)
+                    total_frames_written += n_frames_dpx
+                    log(f"[Merge]     - Saved {n_frames_dpx}/{n_frames_dpx} frames from Rank {r} (total: {total_frames_written} frames)", "info")
+                    del segment_np_dpx
                 else:
                     log(f"[Merge]     - Converting to numpy and saving as PNG...", "info")
                     segment_np = (segment.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
-                    frames_in_rank = 0
-                    for frame_idx in range(segment_np.shape[0]):
-                        frame = segment_np[frame_idx]
-                        frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.png")
-                        cv2.imwrite(frame_filename, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-                        frames_in_rank += 1
-                        total_frames_written += 1
-                        if frames_in_rank % 50 == 0 or frames_in_rank == segment_np.shape[0]:
-                            log(f"[Merge]     - Saved {frames_in_rank}/{segment_np.shape[0]} frames from Rank {r} (total: {total_frames_written} frames)", "info")
+                    n_frames = segment_np.shape[0]
+                    base_idx = total_frames_written
+
+                    def _write_one_png(frame_idx: int) -> None:
+                        path = _frame_filename(base_idx + frame_idx, ".png")
+                        cv2.imwrite(path, cv2.cvtColor(segment_np[frame_idx], cv2.COLOR_RGB2BGR))
+
+                    if num_workers > 1:
+                        with ThreadPoolExecutor(max_workers=num_workers) as ex:
+                            list(ex.map(_write_one_png, range(n_frames)))
+                    else:
+                        for frame_idx in range(n_frames):
+                            _write_one_png(frame_idx)
+                    total_frames_written += n_frames
+                    log(f"[Merge]     - Saved {n_frames}/{n_frames} frames from Rank {r} (total: {total_frames_written} frames)", "info")
                 
                 # 释放内存
                 del segment
@@ -366,7 +423,7 @@ def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: floa
                         # 恢复工具默认保存为线性 RGB（HDR格式）
                         apply_srgb_gamma = False
                         for i in range(missing):
-                            frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.dpx")
+                            frame_filename = _frame_filename(total_frames_written, ".dpx")
                             save_frame_as_dpx10(pad_np, frame_filename, hdr_max=global_hdr_max_all, apply_srgb_gamma=apply_srgb_gamma)
                             total_frames_written += 1
                             if (i + 1) % 10 == 0:
@@ -374,7 +431,7 @@ def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: floa
                     else:
                         padding_np = (last_frame.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')[0]
                         for i in range(missing):
-                            frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.png")
+                            frame_filename = _frame_filename(total_frames_written, ".png")
                             cv2.imwrite(frame_filename, cv2.cvtColor(padding_np, cv2.COLOR_RGB2BGR))
                             total_frames_written += 1
                             if (i + 1) % 10 == 0:
@@ -383,7 +440,10 @@ def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: floa
             elif total_frames is not None and total_frames_written > total_frames:
                 log(f"[Merge] WARNING: Saved {total_frames_written} frames > target {total_frames}. May have extra frames.", "warning")
             
-            fmt_desc = "10-bit DPX (frame_XXXXXX.dpx)" if output_format == "dpx10" else "PNG (frame_XXXXXX.png)"
+            if output_frame_prefix:
+                fmt_desc = f"10-bit DPX ({output_frame_prefix}.<{output_frame_digits}d>.dpx)" if output_format == "dpx10" else f"PNG ({output_frame_prefix}.<{output_frame_digits}d>.png)"
+            else:
+                fmt_desc = "10-bit DPX (frame_XXXXXX.dpx)" if output_format == "dpx10" else "PNG (frame_XXXXXX.png)"
             log(f"\n========== Merge Completed Successfully ==========", "finish")
             log(f"Output directory: {output_path}", "finish")
             log(f"Total frames: {total_frames_written}", "finish")
@@ -558,8 +618,8 @@ def main():
                         help="Output video path (required for --merge_partial)")
     parser.add_argument("--fps", type=float, default=30.0,
                         help="FPS for output video (default: 30.0)")
-    parser.add_argument("--world_size", type=int, default=8,
-                        help="Number of ranks (default: 8)")
+    parser.add_argument("--world_size", type=int, default=None,
+                        help="Number of ranks (default: auto-detect from checkpoint dir)")
     parser.add_argument("--total_frames", type=int, default=None,
                         help="Expected total frames (for validation and padding/cropping)")
     parser.add_argument("--recover_rank", type=int,
@@ -568,6 +628,12 @@ def main():
                         help="Output mode: 'video' for video file (default), 'pictures' for image sequence")
     parser.add_argument("--output_format", type=str, default="png", choices=["png", "dpx10"],
                         help="When output_mode=pictures: 'png' (default) or 'dpx10' (10-bit DPX). Ignored when output_mode=video.")
+    parser.add_argument("--output_frame_prefix", type=str, default=None,
+                        help="When output_mode=pictures: output frame name prefix, e.g. H001_11261139_C001 -> H001_11261139_C001.00000000.png. If not set, use frame_000000.png.")
+    parser.add_argument("--output_frame_digits", type=int, default=6,
+                        help="When output_mode=pictures: number of digits for frame index (default: 6). Use 8 for e.g. .02525084.png.")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="When output_mode=pictures: number of threads for writing frames (default: 0 = auto = min(cpu_count, 32)). Use 1 for single-threaded.")
     
     args = parser.parse_args()
     
@@ -577,7 +643,18 @@ def main():
         if not args.output:
             log("ERROR: --output is required for --merge_partial", "error")
             return
-        merge_partial_results(args.checkpoint_dir, args.output, args.fps, args.world_size, args.total_frames, args.output_mode, args.output_format)
+        merge_partial_results(
+            args.checkpoint_dir,
+            args.output,
+            args.fps,
+            world_size=args.world_size,
+            total_frames=args.total_frames,
+            output_mode=args.output_mode,
+            output_format=args.output_format,
+            output_frame_prefix=args.output_frame_prefix,
+            output_frame_digits=args.output_frame_digits,
+            output_workers=args.workers,
+        )
     elif args.recover_rank is not None:
         recover_rank(args.checkpoint_dir, args.recover_rank, vars(args))
     else:

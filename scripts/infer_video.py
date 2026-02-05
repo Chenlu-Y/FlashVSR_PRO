@@ -72,12 +72,19 @@ FlashVSR 分布式推理脚本
         --checkpoint_dir /app/tmp/checkpoints/{输出名} \
         --status
     
-    # 合并部分结果（即使有些 rank 失败）
+    # 合并部分结果（即使有些 rank 失败）；进程被 SIGKILL 后若 checkpoint 已存，可直接合并无需重跑
     python tools/recover_distributed_inference.py \
         --checkpoint_dir /app/tmp/checkpoints/{输出名} \
         --merge_partial \
-        --output output_partial.mp4 \
-        --output_fps 30.0
+        --output output_partial.mp4
+
+    # 流式合并并输出为图像序列（--output 填输出目录）
+    python tools/recover_distributed_inference.py \
+        --checkpoint_dir /app/tmp/checkpoints/{输出名} \
+        --merge_partial \
+        --output /path/to/output_frames \
+        --output_mode pictures \
+        --output_format png
 
 与原版 infer_video.py 的区别：
 1. 使用 torch.distributed 而非 multiprocessing.Process
